@@ -1,0 +1,277 @@
+// What the proxy and the app (ScsKiller.FileKey, ScsKiller.Signed) share about the recorder's stamp in scskiller.cfg.
+#pragma once
+#include <windows.h>
+#include <shlobj.h>
+#include <bcrypt.h>
+#include <cstring>
+#include <string>
+#include <vector>
+
+// A folder on a local volume. Wine's GetVolumePathNameW fails on a \\?\unix\ path (ERROR_INVALID_NAME): under Wine that
+// is the Linux app's own folder, taken as local.
+inline bool local_folder(const std::wstring& dir) {
+    if (!dir.compare(0, 9, L"\\\\?\\unix\\")) return true;
+    wchar_t vol[MAX_PATH];
+    UINT type;
+    return GetVolumePathNameW(dir.c_str(), vol, MAX_PATH) && ((type = GetDriveTypeW(vol)) == DRIVE_FIXED || type == DRIVE_REMOVABLE || type == DRIVE_RAMDISK);
+}
+
+// The data folder of the SCSKiller copy that placed the recorder in <dir> (trailing backslash): the parent of the
+// armed\ path its scskiller.ledger names (UTF-8, absolute, one line; a portable or test copy's, ScsKiller.LedgerStamp). False:
+// there is none (the installed copy's). There but unusable: true with "".
+inline bool stamped_recorder_dir(const std::wstring& dir, std::wstring& out) {
+    out.clear();
+    const std::wstring file = dir + L"scskiller.ledger";
+    const DWORD a = GetFileAttributesW(file.c_str());   // a link's own attributes: a dangling one is there
+    if (a == INVALID_FILE_ATTRIBUTES) {
+        const DWORD e = GetLastError();
+        return e != ERROR_FILE_NOT_FOUND && e != ERROR_PATH_NOT_FOUND;
+    }
+    if (a & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) return true;   // the app writes a plain file
+    HANDLE h = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return true;
+    FILE_ATTRIBUTE_TAG_INFO tag{};
+    char b[4 * MAX_PATH];
+    DWORD n = 0;
+    const BOOL read = GetFileInformationByHandleEx(h, FileAttributeTagInfo, &tag, sizeof tag) && !(tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+                      && ReadFile(h, b, sizeof b, &n, nullptr);
+    CloseHandle(h);
+    if (!read || n == sizeof b) return true;
+    while (n && (b[n - 1] == '\r' || b[n - 1] == '\n' || b[n - 1] == ' ')) --n;
+    const int m = n ? MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, b, (int)n, nullptr, 0) : 0;
+    if (m <= 3 || m >= MAX_PATH) return true;
+    std::wstring ledger(m, L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, b, (int)n, ledger.data(), m);
+    // as Path.GetFullPath writes it: X:\ or \\server\share, then segments none empty or ending in . or space (Windows drops
+    // those: .. and "x." alias other folders), no device path, stream, wildcard or NUL
+    const bool drive = (ledger[0] | 0x20) >= L'a' && (ledger[0] | 0x20) <= L'z' && ledger[1] == L':' && ledger[2] == L'\\';
+    bool ok = (drive || (ledger[0] == L'\\' && ledger[1] == L'\\')) && ledger.find_first_of(L"/?*<>|\"") == std::wstring::npos
+              && ledger.find(L':', 2) == std::wstring::npos && ledger.find(L'\0') == std::wstring::npos;
+    size_t parts = 0;
+    for (size_t at = drive ? 3 : 2; ok && at <= ledger.size(); ++parts) {
+        size_t end = ledger.find(L'\\', at);
+        if (end == std::wstring::npos) end = ledger.size();
+        ok = end > at && ledger[end - 1] != L'.' && ledger[end - 1] != L' ';
+        at = end + 1;
+    }
+    const size_t cut = ledger.find_last_of(L'\\');
+    if (ok && parts >= (drive ? 2u : 3u) && !_wcsicmp(ledger.c_str() + cut + 1, L"armed")) out = ledger.substr(0, cut);
+    return true;
+}
+
+// The recorder folder (recorder.key, recorder.revoked, refused\) of the copy whose recorder is in <dir> (trailing
+// backslash): stamped_recorder_dir's, else the installed copy's %LOCALAPPDATA%\SCSKiller; "" when it can't be had.
+// SCSKILLER_TEST_RECORDER_DIR replaces it only in a process exporting SCSKiller_WarmHost (selftest, scskiller_warm), never
+// in a game: an environment a launcher or another program passes down can't move where a game's admission reads. Set
+// there but unusable: "", never the real one.
+inline std::wstring recorder_dir(const std::wstring& dir) {
+    if (GetProcAddress(GetModuleHandleW(nullptr), "SCSKiller_WarmHost")) {
+        wchar_t v[MAX_PATH];
+        if (DWORD n = GetEnvironmentVariableW(L"SCSKILLER_TEST_RECORDER_DIR", v, MAX_PATH)) return n < MAX_PATH ? v : L"";
+    }
+    if (dir.empty()) return L"";
+    std::wstring stamped;
+    if (stamped_recorder_dir(dir, stamped)) return stamped;
+    PWSTR local = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &local))) return CoTaskMemFree(local), L"";
+    std::wstring installed = local;
+    CoTaskMemFree(local);
+    return installed + L"\\SCSKiller";
+}
+
+inline std::wstring key_hex(const void* p, size_t n) {
+    UCHAR h[20];
+    if (BCryptHash(BCRYPT_SHA1_ALG_HANDLE, nullptr, 0, (PUCHAR)p, (ULONG)n, h, 20)) return L"";
+    wchar_t hex[41] = {};
+    for (int i = 0; i < 20; ++i) swprintf(hex + 2 * i, 3, L"%02x", h[i]);
+    return hex;
+}
+
+inline std::wstring path_key(std::wstring path) {
+    for (auto& c : path)
+        if (c >= L'A' && c <= L'Z') c += L'a' - L'A';
+    return key_hex(path.data(), path.size() * sizeof(wchar_t));
+}
+
+// The path to open, past MAX_PATH in a process that isn't long-path aware: \\?\ (\\?\UNC\ for a share) in front of an
+// absolute one. \\?\ turns off normalization, so a path with / or a . or .. segment is left as it is (it fails to open).
+inline std::wstring long_path(const std::wstring& p) {
+    if (p.size() < MAX_PATH || p.rfind(L"\\\\?\\", 0) == 0 || p.find(L'/') != std::wstring::npos) return p;
+    for (const wchar_t* dots : {L"\\.\\", L"\\..\\"})
+        if (p.find(dots) != std::wstring::npos) return p;
+    if (p.ends_with(L"\\.") || p.ends_with(L"\\..")) return p;
+    if (p.rfind(L"\\\\", 0) == 0) return L"\\\\?\\UNC\\" + p.substr(2);
+    return p.size() > 2 && p[1] == L':' && p[2] == L'\\' ? L"\\\\?\\" + p : p;
+}
+
+// A folder name in the path ends in a dot or a space: opened with or without \\?\ it can name two folders, so what a check
+// lists could depend on the path's length.
+inline bool odd_name(const std::wstring& p) {
+    for (size_t at = p.find(L'\\', 1); at != std::wstring::npos; at = p.find(L'\\', at + 1))
+        if (p[at - 1] == L'.' || p[at - 1] == L' ') return true;
+    return !p.empty() && (p.back() == L'.' || p.back() == L' ');
+}
+
+// Wine's FILE_ID_INFO: the volume serial is the mount manager's for the drive letter the file was opened through (Z: 0,
+// C: another, the same file either way), the file id the inode. Core on Linux can't know the letter, so under Wine the
+// key has this in the serial's place (GameFiles.WineFileId): "wine-ino".
+inline constexpr ULONGLONG kWineVolume = 0x6f6e692d656e6977;
+
+// The key of a file identity; wine: Wine's (under_wine).
+inline std::wstring id_key(FILE_ID_INFO id, bool wine) {
+    if (wine) id.VolumeSerialNumber = kWineVolume;
+    return key_hex(&id, sizeof id);
+}
+
+// Windows' ntdll never exports it (Vendors.Wine.Running).
+inline bool under_wine() { return GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr; }
+
+// A file's or folder's key: SHA-1 in hex of its file identity (FILE_ID_INFO, 24 bytes: the same through any link, junction
+// or 8.3 name, where a packaged app's process names its exe by the package's WindowsApps link; id_key), else of its final
+// path (no \\?\), else of the path as given (UTF-16LE, A-Z lowered).
+inline std::wstring file_key(const std::wstring& path) {
+    HANDLE f = CreateFileW(long_path(path).c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+        FILE_ID_INFO id;
+        std::wstring key;
+        if (GetFileInformationByHandleEx(f, FileIdInfo, &id, sizeof id)) key = id_key(id, under_wine());
+        std::wstring final(32768, L'\0');
+        DWORD m = key.empty() ? GetFinalPathNameByHandleW(f, final.data(), (DWORD)final.size(), 0) : 0;
+        CloseHandle(f);
+        if (!key.empty()) return key;
+        if (m && m < final.size()) {
+            final.resize(m);
+            return path_key(final.rfind(L"\\\\?\\UNC\\", 0) == 0 ? L"\\\\" + final.substr(8) : final.rfind(L"\\\\?\\", 0) == 0 ? final.substr(4) : final);
+        }
+    }
+    return path_key(path);
+}
+
+inline bool open_id(const std::wstring& path, FILE_ID_INFO& out) {
+    HANDLE f = CreateFileW(long_path(path).c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    const bool ok = GetFileInformationByHandleEx(f, FileIdInfo, &out, sizeof out);
+    CloseHandle(f);
+    return ok;
+}
+
+// Under Wine, the handle's path on the drive dir names: its name without the drive (FileNameInfo, which Wine reads on its
+// Unix side, links resolved as for GetFinalPathNameByHandleW), when that path opens the same file. A game's own hook can
+// answer the name query GetFinalPathNameByHandleW makes with one Wine refuses. "" otherwise.
+// The name is relative to the drive Wine picks, as GetFinalPathNameByHandleW's is: no other letter may open the same file
+// by it, so that drive is the one given (another letter on the same folder refuses, as can an inode of another file system).
+inline std::wstring wine_final_path(HANDLE f, const std::wstring& dir) {
+    const std::wstring p = dir.rfind(L"\\\\?\\", 0) == 0 ? dir.substr(4) : dir;
+    if (p.size() < 3 || p[1] != L':' || p[2] != L'\\') return L"";
+    std::vector<BYTE> b(sizeof(FILE_NAME_INFO) + 65536);
+    auto* n = reinterpret_cast<FILE_NAME_INFO*>(b.data());
+    FILE_ID_INFO held, named;
+    if (!GetFileInformationByHandleEx(f, FileNameInfo, n, (DWORD)b.size()) || n->FileNameLength < sizeof(wchar_t) || n->FileNameLength % sizeof(wchar_t)
+        || n->FileName[0] != L'\\' || !GetFileInformationByHandleEx(f, FileIdInfo, &held, sizeof held))
+        return L"";
+    const std::wstring name(n->FileName, n->FileNameLength / sizeof(wchar_t)), path = p.substr(0, 2) + name;
+    if (!open_id(path, named) || memcmp(&held, &named, sizeof held)) return L"";
+    for (wchar_t l = L'A'; l <= L'Z'; ++l) {  // every letter: GetLogicalDrives misses a dosdevices link the mount manager hasn't seen
+        if (l == towupper(p[0])) continue;
+        if (open_id(std::wstring(1, l) + L":" + name, named)) {
+            if (!memcmp(&named.FileId, &held.FileId, sizeof held.FileId)) return L"";
+        } else if (const DWORD e = GetLastError(); e != ERROR_FILE_NOT_FOUND && e != ERROR_PATH_NOT_FOUND && e != ERROR_NOT_READY && e != ERROR_INVALID_DRIVE)
+            return L"";
+    }
+    return path;
+}
+
+// The folder's final path (links, junctions and 8.3 names resolved; no \\?\) with a trailing backslash; "" when it can't
+// be had (no drive letter maps its volume, for one).
+inline std::wstring final_dir(const std::wstring& dir) {
+    HANDLE f = CreateFileW(long_path(dir).c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return L"";
+    std::wstring final(32768, L'\0');
+    const DWORD m = GetFinalPathNameByHandleW(f, final.data(), (DWORD)final.size(), 0);
+    if (m && m < final.size()) final.resize(m);
+    else final = under_wine() ? wine_final_path(f, dir) : L"";
+    CloseHandle(f);
+    if (final.empty()) return L"";
+    final = final.rfind(L"\\\\?\\UNC\\", 0) == 0 ? L"\\\\" + final.substr(8) : final.rfind(L"\\\\?\\", 0) == 0 ? final.substr(4) : final;
+    return final.back() == L'\\' ? final : final + L'\\';
+}
+
+// A folder identity no file system gives: volume serial 0 and a file id under 16 in both halves, beside an exe whose volume
+// has a serial. In DD2 Character Creator's process (Streamline loaded) every directory open answers serial 0, id 6.
+inline bool made_up_id(const FILE_ID_INFO& dir, const FILE_ID_INFO& exe) {
+    unsigned long long half[2];
+    memcpy(half, dir.FileId.Identifier, sizeof half);
+    return !dir.VolumeSerialNumber && exe.VolumeSerialNumber && half[0] < 16 && half[1] < 16;
+}
+
+// tests: a process exporting SCSKiller_WarmHost (selftest) with SCSKILLER_TEST_MADE_UP_ID set sees every folder's identity as
+// that game's process does, never a game
+inline bool test_made_up(FILE_ID_INFO& id) {
+    if (!GetProcAddress(GetModuleHandleW(nullptr), "SCSKiller_WarmHost") || !GetEnvironmentVariableW(L"SCSKILLER_TEST_MADE_UP_ID", nullptr, 0)) return false;
+    id = {0, {{6, 0, 0, 0, 0, 0, 0, 0, 6}}};
+    return true;
+}
+
+// The folder's file_key as this process reads it (test_made_up's in tests).
+inline std::wstring folder_file_key(const std::wstring& dir) {
+    FILE_ID_INFO id;
+    return test_made_up(id) ? key_hex(&id, sizeof id) : file_key(dir);
+}
+
+// The file's hard links; 0 when it can't be read.
+inline DWORD hard_links(const std::wstring& path) {
+    HANDLE f = CreateFileW(long_path(path).c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    BY_HANDLE_FILE_INFORMATION info;
+    const DWORD n = GetFileInformationByHandle(f, &info) ? info.nNumberOfLinks : 0;
+    CloseHandle(f);
+    return n;
+}
+
+// This process makes up the folder's identity (made_up_id against the exe's). Never under Wine, whose ids are inodes.
+inline bool made_up_here(const std::wstring& dir, const std::wstring& exe) {
+    FILE_ID_INFO d, e;
+    if (under_wine() || !open_id(dir, d) || !open_id(exe, e)) return false;
+    test_made_up(d);
+    return made_up_id(d, e);
+}
+
+// Under Wine (folder ids: the drive's serial, the exe's through the same letter, and an inode of at most 64 bits, with a
+// link): made_up, the exe's folder dir reads otherwise in this process. A game's hook there makes up every folder handle's
+// identity and name (serial 0, id 4:4, no link in DD2 Character Creator, a new id per open in SF6) and can crash on a call
+// past these. False when they can't be read.
+inline bool wine_made_up(const std::wstring& dir, const std::wstring& exe, bool& made_up) {
+    made_up = false;
+    FILE_ID_INFO d, e;
+    BY_HANDLE_FILE_INFORMATION info;
+    HANDLE f = CreateFileW(long_path(dir).c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    const bool read = GetFileInformationByHandleEx(f, FileIdInfo, &d, sizeof d) && GetFileInformationByHandle(f, &info);
+    CloseHandle(f);
+    if (!read || !open_id(exe, e)) return false;
+    unsigned long long half[2];
+    memcpy(half, d.FileId.Identifier, sizeof half);
+    made_up = !info.nNumberOfLinks || d.VolumeSerialNumber != e.VolumeSerialNumber || half[1];
+    return true;
+}
+
+// A folder's key by its path (ScsKiller.PathFolderKey): path_key of its final path without the trailing backslash, as the
+// recorder folder's stamps\ and revocation list carry it beside file_key; "" when it can't be had.
+inline std::wstring path_folder_key(const std::wstring& dir) {
+    const std::wstring f = final_dir(dir);
+    return f.empty() ? L"" : path_key(f.size() > 3 ? f.substr(0, f.size() - 1) : f);
+}
+
+// sig=: the HMAC-SHA1 (lower-case hex) under key of "<exe's file_key>\n<its folder's file_key>\n" + stamp +
+// "root=<root>\n<root's file_key>\n", UTF-16LE, where stamp is admission.h's signed_stamp, and the root is
+// root= resolved from the exe's final_dir. "" when it can't be made.
+inline std::wstring recorder_sig(const std::string& key, const std::wstring& exe_key, const std::wstring& dir_key, const std::wstring& stamp, const std::wstring& root,
+                                 const std::wstring& root_key) {
+    const std::wstring msg = exe_key + L"\n" + dir_key + L"\n" + stamp + L"root=" + root + L"\n" + root_key + L"\n";
+    UCHAR mac[20];
+    if (key.empty() || BCryptHash(BCRYPT_HMAC_SHA1_ALG_HANDLE, (PUCHAR)key.data(), (ULONG)key.size(), (PUCHAR)msg.data(), (ULONG)(msg.size() * sizeof(wchar_t)), mac, 20))
+        return L"";
+    wchar_t hex[41] = {};
+    for (int i = 0; i < 20; ++i) swprintf(hex + 2 * i, 3, L"%02x", mac[i]);
+    return hex;
+}

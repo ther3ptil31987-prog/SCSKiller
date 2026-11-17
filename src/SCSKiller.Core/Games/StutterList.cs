@@ -4,7 +4,7 @@ using SCSKiller.Core.App;
 namespace SCSKiller.Core.Games;
 
 /// <summary>Games known to suffer shader-compilation stutter: known-stutter.json, embedded in Core (the default) and
-/// served at /v1/content/known-stutter.json (server-rs\content\known-stutter.json) so it can change without a release.
+/// served at /v1/content/known-stutter.json so it can change without a release.
 /// Matched by store id (Game.Id), else by name (letters and digits only, case-insensitive: "STAR WARS Jedi: Survivor™"
 /// = "Star Wars Jedi Survivor"). The server's copy replaces the embedded one when it passes <see cref="TryParse"/>
 /// (<see cref="ContentFile"/>).</summary>
@@ -14,7 +14,7 @@ public sealed class StutterList
     /// <summary>The source of an entry SCSKiller measured itself; any other source is an https URL.</summary>
     public const string OwnMeasurement = "SCSKiller measurement";
     public const int MaxBytes = ContentFile.MaxBytes, MaxGames = 200;
-    static readonly string[] Stores = ["steam", "xbox", "epic", "ea", "gog", "ubisoft", "battlenet", "purple"];
+    static readonly string[] Stores = ["steam", "xbox", "epic", "ea", "gog", "ubisoft", "battlenet", "purple", "hoyoplay", "gaijin", "riot", "wegame"];
 
     sealed record Entry(string Name, string[] Ids, string Severity, string Reason, string Source, string Date);
     sealed record ListFile(Entry[] Games, string? About = null);
@@ -50,12 +50,12 @@ public sealed class StutterList
 
     static bool Text(string? s, int max) => ContentFile.Text(s, max);
 
-    static bool IsId(string? id) =>
+    internal static bool IsId(string? id) =>
         id is { Length: <= 120 } && id.IndexOf(':') is var c and > 0 && Stores.Contains(id[..c]) && id.Length > c + 1
         && id[(c + 1)..].All(ch => char.IsAsciiLetterOrDigit(ch) || ch is '.' or '_' or '-')
         && (id[..c] != "steam" || id[(c + 1)..].All(char.IsAsciiDigit));
 
-    static bool IsHttps(string url) =>
+    internal static bool IsHttps(string url) =>
         Uri.TryCreate(url, UriKind.Absolute, out var u) && u.Scheme == Uri.UriSchemeHttps && u.IsDefaultPort && u.UserInfo.Length == 0;
 
     public static StutterList Embedded { get => field ??= TryParse(ContentFile.Embedded("SCSKiller.Core.Games.known-stutter.json"))!; }
@@ -72,9 +72,9 @@ public sealed class StutterList
 
     /// <summary>The Library's "Recommended" section: every listed game SCSKiller can compile (Ready, Stale, NeedsRecording,
     /// Warmed), the ones still to do first, then severe first, then by name. Warmed ones stay, last.
-    /// Anti-cheat-blocked games are Unsupported, so they stay out.</summary>
+    /// Anti-cheat-blocked games are Unsupported, and one waiting for an offline session (a ban risk) isn't recommended either.</summary>
     public static List<GameState> Recommended(IEnumerable<GameState> games) => games
-        .Where(s => s.KnownStutter != null && s.Status is GameStatus.Ready or GameStatus.Stale or GameStatus.NeedsRecording or GameStatus.Warmed)
+        .Where(s => s.KnownStutter != null && s.Status is GameStatus.Ready or GameStatus.Stale or GameStatus.NeedsRecording or GameStatus.Warmed && !App.ScsKiller.NeedsOfflineSession(s))
         .OrderBy(s => s.Status == GameStatus.Warmed).ThenByDescending(s => s.KnownStutter!.Severity)
         .ThenBy(s => s.Game.Name, StringComparer.CurrentCultureIgnoreCase).ToList();
 

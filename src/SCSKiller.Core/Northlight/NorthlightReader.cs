@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 using SCSKiller.Core.Carved;
+using SCSKiller.Core.Games;
 using SCSKiller.Core.Unreal;
 
 namespace SCSKiller.Core.Northlight;
@@ -12,9 +13,10 @@ namespace SCSKiller.Core.Northlight;
 /// (<see cref="Records"/>): DXBC SM5.1 vertex, pixel and compute shaders, and DXIL ray tracing libraries (lib_6_3). The
 /// resource packs (.rmdp) hold no shaders. Every distinct pipeline record (VS+PS, or a lone CS) is one IsPipeline map, the
 /// libraries one pool. Shaders carry no root signature: the engine builds one graphics and one compute root signature in code
-/// (<see cref="Planning.RootSig.Rule.Northlight"/>). The DX11 set in data\shaders\build\pc_dx11 (SM 5.0, same layout) is
+/// (plan-rules.json's northlight rule). The DX11 set in data\shaders\build\pc_dx11 (SM 5.0, same layout) is
 /// indexed under <see cref="Platform11"/>, one map per file: D3D11 shaders only, never part of a D3D12 pipeline.
-/// EngineInfo: Family "Northlight", Version "DX12"; GraphicsApi "D3D11 or D3D12" when the DX11 set is there.</summary>
+/// EngineInfo: Family "Northlight", Version "DX12"; GraphicsApi "D3D11 or D3D12" when the DX11 set is there. Northlight 2
+/// (.rmdtoc archives: Alan Wake 2, CONTROL Resonant) is left to the carver, which reports it as its own family.</summary>
 public sealed class NorthlightReader : IEngineReader
 {
     public const string Family = "Northlight", Version = "DX12";
@@ -37,14 +39,16 @@ public sealed class NorthlightReader : IEngineReader
     /// carver's; ReadShaders re-indexes when it runs without an Index in the same process.</summary>
     readonly ConcurrentDictionary<string, IReadOnlyDictionary<string, Loc>> located = new();
 
+    public int ReaderVersion(EngineInfo engine) => 3;
+
     public EngineInfo? Detect(Game game)
     {
-        var dir = Path.Combine(game.InstallDir, Dir);
-        if (!Directory.Exists(dir)) return null;
+        var dir = GameFiles.Find(game.InstallDir, Dir);
+        if (!Directory.Exists(dir) || CarvedReader.IsNorthlight2(game.InstallDir)) return null; // Northlight 2 builds its root signatures otherwise
         foreach (var f in Effects(dir).OrderBy(f => f.Length).Take(DetectFiles))
             if (Records(Read(f.FullName), default) is { } recs && recs.Any(r => r.Select(c => c.Kind).Order().SequenceEqual([0, 1])))
                 // Control runs on either API (Steam: an exe per API); its files don't say which one is played
-                return new EngineInfo(Family, Version, null, Effects(Path.Combine(game.InstallDir, Dir11)).Any() ? UnrealRhi.Ambiguous : "D3D12", false, null);
+                return new EngineInfo(Family, Version, null, Effects(GameFiles.Find(game.InstallDir, Dir11)).Any() ? UnrealRhi.Ambiguous : "D3D12", false, null);
         return null;
     }
 
@@ -59,13 +63,13 @@ public sealed class NorthlightReader : IEngineReader
         int records = 0, visited = 0, pooled = 0, unlinked = 0, malformed = 0, overCap = 0, bad = 0;
         using var content = IncrementalHash.CreateHash(HashAlgorithmName.SHA1);
         foreach (var (dir, dx11) in new[] { (Dir, false), (Dir11, true) })
-        foreach (var f in Effects(Path.Combine(game.InstallDir, dir)).OrderBy(f => f.Name, StringComparer.OrdinalIgnoreCase))
+        foreach (var f in Effects(GameFiles.Find(game.InstallDir, dir)).OrderBy(f => f.Name, StringComparer.OrdinalIgnoreCase))
         {
             ct.ThrowIfCancellationRequested();
-            var rel = Path.GetRelativePath(game.InstallDir, f.FullName);
+            var rel = GameFiles.Rel(game.InstallDir, f.FullName, f.DirectoryName!, dir);
             var b = Read(f.FullName);
             if (Records(b, ct) is not { } recs) continue;
-            content.AppendData(Encoding.UTF8.GetBytes($"{rel}|{f.Length}|{f.LastWriteTimeUtc.Ticks}\n"));
+            content.AppendData(Encoding.UTF8.GetBytes(ContentStamps.Of(rel, f.FullName)));
             var pool = new List<string>();
             foreach (var r in recs)
             {
@@ -187,7 +191,7 @@ public sealed class NorthlightReader : IEngineReader
     }
 
     static IEnumerable<FileInfo> Effects(string dir) =>
-        Directory.Exists(dir) ? new DirectoryInfo(dir).EnumerateFiles("*.obj", new EnumerationOptions { IgnoreInaccessible = true }) : [];
+        Directory.Exists(dir) ? GameFiles.EnumerateFiles(new DirectoryInfo(dir), "*.obj", new EnumerationOptions { IgnoreInaccessible = true, AttributesToSkip = 0 }) : [];
 
     /// <summary>The file's bytes when it starts with the effect magic and is at most <see cref="MaxFile"/>; else empty.</summary>
     static byte[] Read(string path)

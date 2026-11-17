@@ -17,13 +17,15 @@ namespace SCSKiller.Core.Dagor;
 /// domain and geometry shaders it is drawn with. DirectX 11 entries are plain DXBC back to back, one map each (platform
 /// PCD3D_SM5). A DirectX 12 entry's metadata holds a dxil::ShaderHeader per stage and where its DXIL is; the root signature
 /// is built from those headers (<see cref="DagorRootSig"/>), and every vertex/pixel and compute pass of the shader classes
-/// is one exact pipeline (platform PCD3D_SM6). GraphicsApi: config.blk's video/driver ("auto" or none: "D3D11 or D3D12").
+/// is one exact pipeline (platform PCD3D_SM6); a pass without a pixel shader is drawn with the driver's null pixel shader
+/// (<see cref="NullPixelShader"/>). GraphicsApi: config.blk's video/driver ("auto" or none: "D3D11 or D3D12").
 /// EngineInfo: Family "Dagor", Version "11.3".</summary>
 public sealed class DagorReader : IEngineReader
 {
     public const string Family = "Dagor", Version = "11.3", Platform = "PCD3D_SM5", Platform12 = "PCD3D_SM6";
 
-    const int HeaderSize = 64, MaxShader = 256 << 20, NoShader = 0xFFFF;
+    const int HeaderSize = 64, MaxShader = 256 << 20, NoShader = 0xFFFF, MaxNullShader = 64 << 10;
+    const long MaxExe = 2L << 30;
     // ScriptedShadersBinDump fields of version 11.3: vprCount, fshCount, classes, uncompressed_shader_sizes, shaders_metadata, shaders, dictionary
     const int VprCount = 16, FshCount = 20, Classes = 140, Sizes = 172, Metadata = 180, Codes = 188, Dictionary = 196;
     // sizes of ShaderClass, ShaderCode (its passes at 20) and Pass (its ShRef pointer first: vprId, fshId)
@@ -31,9 +33,11 @@ public sealed class DagorReader : IEngineReader
     // dxil::StoredShaderType; dxil::Shader up to its bytecode offset and size
     const int SingleShader = 0, CombinedVertexShader = 1, ShaderSize = DagorRootSig.HeaderSize + 8;
 
+    public int ReaderVersion(EngineInfo engine) => 4;
+
     public EngineInfo? Detect(Game game)
     {
-        if (!Directory.Exists(Path.Combine(game.InstallDir, "compiledShaders"))) return null;
+        if (!Directory.Exists(GameFiles.Find(game.InstallDir, DumpDir))) return null;
         if (Dumps(game).FirstOrDefault().Path is not { } path) return null;
         Span<byte> h = stackalloc byte[12];
         try
@@ -53,12 +57,12 @@ public sealed class DagorReader : IEngineReader
 
     public string DetectStamp(Game game, EngineInfo? engine)
     {
-        var f = new FileInfo(Path.Combine(game.InstallDir, "config.blk"));
+        var f = new FileInfo(GameFiles.Find(game.InstallDir, "config.blk"));
         return (f.Exists ? $"{f.Length}:{f.LastWriteTimeUtc.Ticks}" : "-") + (CbvRanges(game) ? "|cbv" : "");
     }
 
     /// <summary>EngineInfo.Fork of a game whose root signatures put constant buffers in descriptor tables
-    /// (dx12/rootSignaturesUsesCBVDescriptorRanges, <see cref="Planning.RootSig.Rule.DagorCbvRanges"/>).</summary>
+    /// (dx12/rootSignaturesUsesCBVDescriptorRanges, plan-rules.json's dagor-cbv-ranges rule).</summary>
     public const string CbvRangesFork = "cbv-ranges";
 
     /// <summary>The engine's dx12/rootSignaturesUsesCBVDescriptorRanges: flag 1 of cache\dx12.cache's header (CX12, version 34),
@@ -68,7 +72,7 @@ public sealed class DagorReader : IEngineReader
         Span<byte> h = stackalloc byte[32];
         try
         {
-            using var f = Open(Path.Combine(game.InstallDir, "cache", "dx12.cache"));
+            using var f = Open(GameFiles.Find(game.InstallDir, @"cache\dx12.cache"));
             if (f.ReadAtLeast(h, 32, throwOnEndOfStream: false) == 32 && h.StartsWith("CX12"u8) && BinaryPrimitives.ReadUInt32LittleEndian(h[4..]) == 34)
                 return (BinaryPrimitives.ReadUInt32LittleEndian(h[28..]) & 1) != 0;
         }
@@ -79,8 +83,8 @@ public sealed class DagorReader : IEngineReader
     /// <summary>The dumps config.blk's compatibility mode selects (switching it changes which shaders the game loads), and the
     /// constant-buffer mode (<see cref="CbvRanges"/>: it changes every root signature the plan builds).</summary>
     public string IndexStamp(Game game) =>
-        !Directory.Exists(Path.Combine(game.InstallDir, "compiledShaders")) ? ""
-        : string.Join(';', Dumps(game).Select(d => new FileInfo(d.Path)).Select(f => $"{f.Name}|{f.Length}|{f.LastWriteTimeUtc.Ticks}")) + (CbvRanges(game) ? "|cbv" : "");
+        !Directory.Exists(GameFiles.Find(game.InstallDir, DumpDir)) ? ""
+        : string.Join(';', Dumps(game).Select(d => (d.Name, File: new FileInfo(d.Path))).Select(f => $"{f.Name}|{f.File.Length}|{f.File.LastWriteTimeUtc.Ticks}")) + (CbvRanges(game) ? "|cbv" : "");
 
     public ShaderIndex Index(Game game, EngineInfo engine, IProgress<string>? log, CancellationToken ct)
     {
@@ -109,11 +113,11 @@ public sealed class DagorReader : IEngineReader
             if (maps.TryAdd(h, new ShaderMap(h, rel, platform, shas, pipeline))) platforms.Add(platform);
         }
 
-        foreach (var (path, dx12) in Dumps(game))
+        foreach (var (path, name, dx12) in Dumps(game))
         {
-            var rel = Path.GetRelativePath(game.InstallDir, path);
+            var rel = GameFiles.Rel(game.InstallDir, path, path, $@"{DumpDir}\{name}");
             var file = new FileInfo(path);
-            stamp.Append($"{rel}|{file.Length}|{file.LastWriteTimeUtc.Ticks}\n");
+            stamp.Append(ContentStamps.Of(rel, file.FullName));
             var body = Body(Read(path));
             if (!dx12)
             {
@@ -127,6 +131,16 @@ public sealed class DagorReader : IEngineReader
                 continue;
             }
             int skipped = 0, depthOnly = 0, unusable = 0, pipelines = 0;
+            string? nullPs = null;
+            var nullRead = false;
+            string? NullPs()
+            {
+                if (nullRead) return nullPs;
+                nullRead = true;
+                if (NullPixelShader(game, ct) is not (FileInfo f, byte[] c)) return null;
+                stamp.Append(ContentStamps.Of(GameFiles.Rel(game.InstallDir, f.FullName), f.FullName));
+                return nullPs = Add(c, null);
+            }
             var byEntry = Entries(body, ct).Select(e =>
             {
                 if (Stages(e) is not { } stages) { skipped++; return null; }
@@ -136,15 +150,21 @@ public sealed class DagorReader : IEngineReader
             var vprCount = (int)U(body, VprCount);
             foreach (var (vpr, fsh) in Passes(body, vprCount, byEntry.Count - vprCount))
             {
-                if (vpr != NoShader && fsh == NoShader) { depthOnly++; continue; }   // drawn with the engine's null pixel shader, not known here
-                List<string>?[] parts = vpr == NoShader ? [byEntry[vprCount + fsh]] : [byEntry[vpr], byEntry[vprCount + fsh]];
+                List<string>?[] parts;
+                if (fsh == NoShader)
+                {
+                    depthOnly++;
+                    if (NullPs() is not { } n) continue;
+                    parts = [byEntry[vpr], [n]];
+                }
+                else parts = vpr == NoShader ? [byEntry[vprCount + fsh]] : [byEntry[vpr], byEntry[vprCount + fsh]];
                 if (parts.Any(p => p == null)) { unusable++; continue; }
                 var shas = parts.SelectMany(p => p!).ToList();
                 Map(rel, shas.Select(lanes.GetValueOrDefault).FirstOrDefault(x => x != null) ?? Platform12, shas, true);
                 pipelines++;
             }
             log?.Report($"{rel}: {byEntry.Count} entries ({skipped} of a kind not read: stream output, mesh, library), {pipelines} pipelines in its passes"
-                + $" ({depthOnly} drawn without a pixel shader and {unusable} with an unparseable shader left out)");
+                + $" ({depthOnly} drawn with the driver's null pixel shader{(depthOnly > 0 && nullPs == null ? ", left out: the exe has no single one" : "")}; {unusable} with an unparseable shader left out)");
         }
         log?.Report($"{shaders.Count} shaders ("
             + string.Join(", ", shaders.Values.GroupBy(s => s.Stage).OrderByDescending(g => g.Count()).Select(g => $"{g.Count()} {g.Key}"))
@@ -157,7 +177,7 @@ public sealed class DagorReader : IEngineReader
     public void ReadShaders(Game game, EngineInfo engine, IReadOnlySet<string> sha1s, Action<string, byte[]> sink, CancellationToken ct)
     {
         var left = new HashSet<string>(sha1s);
-        foreach (var (path, dx12) in Dumps(game))
+        foreach (var (path, _, dx12) in Dumps(game))
             foreach (var e in Entries(Body(Read(path)), ct))
             {
                 var containers = dx12 ? Stages(e)?.Select(s => s.Container) ?? [] : Dxbc.Containers(e.Blob).Select(c => c.Container);
@@ -168,16 +188,41 @@ public sealed class DagorReader : IEngineReader
                         if (left.Count == 0) return;
                     }
             }
+        if (Dumps(game).Any(d => d.Dx12) && NullPixelShader(game, ct) is (_, byte[] n) && Convert.ToHexStringLower(SHA1.HashData(n)) is var h && left.Contains(h))
+            sink(h, n);
+    }
+
+    /// <summary>The exe and the pixel shader Dagor's DirectX 12 driver puts in a pipeline whose pass has none (drv3d_DX12
+    /// initNullPixelShader, an empty main, its dxil::ShaderHeader all zero): the exe's one DXIL pixel shader with no inputs,
+    /// outputs or resources. Null when the exe can't be read or holds none or several.</summary>
+    internal static (FileInfo Exe, byte[] Container)? NullPixelShader(Game game, CancellationToken ct)
+    {
+        var exe = new FileInfo(GaijinSource.Exe(game.InstallDir) ?? game.ExePath);
+        if (!exe.Exists || exe.Length > MaxExe) return null;   // its length and time are kept from here for the stamp
+        byte[]? found = null;
+        var n = 0;
+        CarvedReader.Scan(exe, new byte[CarvedReader.Block], [(0, exe.Length)], (_, c) =>
+        {
+            if (Dxbc.Part(c, "DXIL"u8).IsEmpty) return;
+            try
+            {
+                if (ShaderContainer.Parse(c, "", new(0, 0, 0, 0)) is { Stage: Stage.Pixel, Inputs.Count: 0, Outputs.Count: 0, Bindings.Count: 0 } && n++ == 0)
+                    found = c.ToArray();
+            }
+            catch (Exception e) when (e is ArgumentException or IndexOutOfRangeException) { }
+        }, ct, MaxNullShader);
+        return n == 1 ? (exe, found!) : null;
     }
 
     /// <summary>The dumps of the mode config.blk selects that exist: DirectX 11's, then DirectX 12's.</summary>
-    static IEnumerable<(string Path, bool Dx12)> Dumps(Game game)
+    static IEnumerable<(string Path, string Name, bool Dx12)> Dumps(Game game)
     {
         var compatibility = Video(game, "compatibilityMode") is "yes" or "true" or "1";
-        var dir = Path.Combine(game.InstallDir, "compiledShaders");
-        foreach (var (name, dx12) in new[] { (compatibility ? "game.compatibility" : "game", false), (compatibility ? "game.compatibilityDX12" : "gameDX12", true) })
-            if (Path.Combine(dir, name + ".ps50.shdump.bin") is var p && File.Exists(p)) yield return (p, dx12);
+        foreach (var (mode, dx12) in new[] { (compatibility ? "game.compatibility" : "game", false), (compatibility ? "game.compatibilityDX12" : "gameDX12", true) })
+            if (mode + ".ps50.shdump.bin" is var name && GameFiles.Find(game.InstallDir, $@"{DumpDir}\{name}") is var p && File.Exists(p)) yield return (p, name, dx12);
     }
+
+    const string DumpDir = "compiledShaders";
 
     /// <summary>The main layout of a version 11.3 dump, decompressed.</summary>
     internal static byte[] Body(byte[] dump)
@@ -301,7 +346,7 @@ public sealed class DagorReader : IEngineReader
     internal static string? Video(Game game, string name)
     {
         string text;
-        try { text = File.ReadAllText(Path.Combine(game.InstallDir, "config.blk")); }
+        try { text = File.ReadAllText(GameFiles.Find(game.InstallDir, "config.blk")); }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return null; }
         var block = VideoBlock(text);
         if (block == null) return null;

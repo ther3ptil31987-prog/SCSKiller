@@ -2,12 +2,17 @@
 .SYNOPSIS
 Builds dist\SCSKiller\ and dist\SCSKiller.zip:
 
-  SCSKiller.exe            WinUI app, self-contained (.NET + Windows App SDK), + oodle-data-shared.dll, zlib-ng2.dll
-  cli\scskiller.exe        command line, self-contained, same Core project and commit, + the two codec DLLs
+  SCSKiller.exe            the app (src\SCSKiller.Ui, Avalonia), self-contained (.NET + Windows App SDK Foundation), + oodle-data-shared.dll, zlib-ng2.dll, the VC++ runtime (VC-REDIST.txt)
+  cli\scskiller.exe        command line, self-contained, same Core project and commit, + the two codec DLLs and the VC++ runtime
   cli\scskillerw.exe       the same CLI flagged as a GUI-subsystem exe: what the scheduled task runs (no console window)
-  native\                  scskiller_warm.exe + the proxy d3d12.dll (the app looks in native\, the CLI in ..\native\)
+  native\                  scskiller_warm.exe + the proxy d3d12.dll + the DirectX 9 recorder d3d9.dll (x86\ for 32-bit
+                           games) (the app looks in native\, the CLI in ..\native\)
+                           + scskiller_ags.dll (the same recorder as an AMD AGS wrapper, installed as a game's amd_ags_x64.dll)
                            + amd_ags_x64.dll (AMD AGS, downloaded by the proxy's CMake configure)
                            + segheap\scskiller_warm.exe (the same on the segment heap: NVIDIA's warm)
+                           + fossilize-replay.exe (Fossilize's replayer, patched in the proxy's CMake: the Vulkan warm's)
+                           + VkLayer_scskiller.dll (Fossilize's capture layer, patched the same: the Vulkan recorder)
+                           + preload\winmm.dll, version.dll, dinput8.dll (the recorder's preloader in Streamline games)
   THIRD-PARTY-NOTICES.md   every third-party component and its licence; notices\ holds the Microsoft packages' own notices
 
 The CLI can't sit next to the app: scskiller.exe and SCSKiller.exe are the same file name on NTFS.
@@ -17,8 +22,10 @@ established, THIRD-PARTY-NOTICES.md); UnrealReader and the FromSoft reader downl
 
 -Version X.Y.Z[-pre] (a leading v is dropped) stamps every exe and DLL with the same ProductVersion (SignPath).
 Without it: the v* tag at HEAD if there is exactly one, else the dev default 0.0.0-internal.0+<sha>.
+
+-NativeOnly stops after native\: the files build/publish-linux.sh takes from a Windows build (CI's pull requests).
 #>
-param([string]$Configuration = "Release", [switch]$NoZip, [switch]$NoOodle, [string]$Version)
+param([string]$Configuration = "Release", [switch]$NoZip, [switch]$NoOodle, [string]$Version, [switch]$NativeOnly)
 $ErrorActionPreference = "Stop"
 $repo = Split-Path $PSScriptRoot -Parent
 
@@ -30,9 +37,17 @@ if (-not $Version) {
 }
 $Version = $Version -replace '^v', ''
 if ($Version -and $Version -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$') { throw "not a SemVer X.Y.Z[-pre]: $Version" }
+# a versioned build verifies the server's signed lists: the rules key must be pinned (tools/release-sign keygen --for rules)
+if ($Version -and (Get-Content (Join-Path $repo "src\SCSKiller.Core\App\ContentTrust.cs") -Raw) -notmatch '\["rules-a"\]\s*=\s*"[A-Za-z0-9+/]{43}="') {
+    throw "ContentTrust.RulesKeys has no rules-a key: pin the public key from tools/release-sign keygen --for rules before a release"
+}
 $versionArgs = if ($Version) { @("-p:Version=$Version", "-p:IncludeSourceRevisionInInformationalVersion=false") } else { @() }
+# Published debug symbols embed the private checkout path and repository URL.
+$versionArgs += "-p:DebugType=None", "-p:DebugSymbols=false"
 Write-Host "version: $(if ($Version) { $Version } else { '0.0.0-internal.0 (dev)' })"
 $dotnet = Join-Path $env:LOCALAPPDATA "Microsoft\dotnet\dotnet.exe"   # .NET 10 SDK is per user; PATH may have an older one
+# setup-dotnet's SDK sets the shipped runtime: a runner account's per-user SDK can be older
+if ($env:DOTNET_ROOT -and (Test-Path (Join-Path $env:DOTNET_ROOT "dotnet.exe"))) { $dotnet = Join-Path $env:DOTNET_ROOT "dotnet.exe" }
 if (-not (Test-Path $dotnet)) { $dotnet = "dotnet" }
 $dist = Join-Path $repo "dist"
 $out = Join-Path $dist "SCSKiller"
@@ -43,6 +58,12 @@ function Run([string]$exe, [string[]]$argv) {
     & $exe @argv
     if ($LASTEXITCODE -ne 0) { throw "$exe $argv failed with exit code $LASTEXITCODE" }
 }
+# no game key in anything built: the removed ones by hash, any other key-shaped constant unless reviewed (tools/keyscan)
+function KeyScan([string[]]$paths) {
+    # the workflow's VERSION env (with its v) reaches MSBuild as the Version property: restore fails on it
+    Run $dotnet (@("run", "--project", (Join-Path $repo "tools\keyscan"), "-c", "Release") + $versionArgs + @("--", "--known", (Join-Path $repo "build\keyscan\known-keys.txt"),
+        "--allow", (Join-Path $repo "build\keyscan\allow.txt")) + $paths)
+}
 
 if (Test-Path $out) { Remove-Item $out -Recurse -Force }
 
@@ -52,13 +73,26 @@ $scskVersion = if ($Version) { $Version } else { "0.0.0-internal.0" }   # every 
 Run cmake @("-S", (Join-Path $repo "proxy"), "-B", $build, "-A", "x64", "-DSCSK_VERSION=$scskVersion")
 Run cmake @("--build", $build, "--config", "Release")
 New-Item -ItemType Directory -Force $native | Out-Null
-Copy-Item (Join-Path $build "Release\scskiller_warm.exe"), (Join-Path $build "Release\d3d12.dll"), (Join-Path $build "Release\amd_ags_x64.dll") $native
-New-Item -ItemType Directory -Force (Join-Path $native "segheap") | Out-Null
+Copy-Item (Join-Path $build "Release\scskiller_warm.exe"), (Join-Path $build "Release\d3d12.dll"), (Join-Path $build "Release\amd_ags_x64.dll"), (Join-Path $build "Release\scskiller_ags.dll"), (Join-Path $build "Release\fossilize-replay.exe"), (Join-Path $build "Release\VkLayer_scskiller.dll") $native
+New-Item -ItemType Directory -Force (Join-Path $native "segheap"), (Join-Path $native "preload") | Out-Null
+Copy-Item (Join-Path $build "Release\preload\*.dll") (Join-Path $native "preload")
 Copy-Item (Join-Path $build "Release\segheap\scskiller_warm.exe") (Join-Path $native "segheap")
+# the DirectX 9 recorder, also as x86 for 32-bit games: a Win32 build of the same CMake project makes only it
+$build86 = Join-Path $repo "proxy\build-x86"
+Run cmake @("-S", (Join-Path $repo "proxy"), "-B", $build86, "-A", "Win32", "-DSCSK_VERSION=$scskVersion")
+Run cmake @("--build", $build86, "--config", "Release")
+New-Item -ItemType Directory -Force (Join-Path $native "x86") | Out-Null
+Copy-Item (Join-Path $build "Release\d3d9.dll") $native
+Copy-Item (Join-Path $build86 "Release\d3d9.dll") (Join-Path $native "x86")
+if ($NativeOnly) { KeyScan @($native); Write-Host "dist\SCSKiller\native only"; return }
 
 # 2. app + CLI
-Run $dotnet (@("publish", (Join-Path $repo "src\SCSKiller.App\SCSKiller.App.csproj"), "-c", $Configuration, "-r", "win-x64",
-    "--self-contained", "true", "-p:Platform=x64", "-p:EnableMsixTooling=true", "-o", $out) + $versionArgs)   # MSIX tooling: else the app's .pri/.xbf aren't published and XAML crashes at start
+# the SDK reuses obj\...\apphost.exe until the assembly changes, so a CETCompat change alone would ship the old flag
+Get-ChildItem (Join-Path $repo "src") -Recurse -Filter apphost.exe | Where-Object FullName -like "*\obj\*" | Remove-Item
+Run $dotnet (@("publish", (Join-Path $repo "src\SCSKiller.Ui\SCSKiller.Ui.csproj"), "-c", $Configuration, "-f", "net10.0-windows10.0.26100.0", "-r", "win-x64",
+    "--self-contained", "true", "-o", $out) + $versionArgs)
+# the SkiaSharp and HarfBuzz native packages carry their own .pdb, which DebugType=None doesn't drop
+Get-ChildItem $out -Filter *.pdb | Remove-Item
 Run $dotnet (@("publish", (Join-Path $repo "src\SCSKiller.Cli\SCSKiller.Cli.csproj"), "-c", $Configuration, "-r", "win-x64",
     "--self-contained", "true", "-o", $cli) + $versionArgs)
 
@@ -70,30 +104,78 @@ if ($bytes[$subsystem] -ne 3) { throw "scskiller.exe: unexpected PE subsystem $(
 $bytes[$subsystem] = 2
 [IO.File]::WriteAllBytes((Join-Path $cli "scskillerw.exe"), $bytes)
 
-# 4. codecs next to both executables (UnrealReader loads them from AppContext.BaseDirectory): local copies first
-#    (this checkout, then the main checkout when run from a git worktree), else CUE4Parse downloads them.
-$codecs = @(if (-not $NoOodle) { "oodle-data-shared.dll" }) + "zlib-ng2.dll"
-$roots = @($repo)
-try { $common = git -C $repo rev-parse --path-format=absolute --git-common-dir } catch { $common = $null }
-if ($common) { $roots += Split-Path $common -Parent }
-$dirs = $roots | Select-Object -Unique | ForEach-Object { Join-Path $_ "tools\ueshaders"; Join-Path $_ "tools\ueshaders\bin\Release\net10.0" }
-foreach ($c in $codecs) {
-    $found = $dirs | ForEach-Object { Join-Path $_ $c } | Where-Object { Test-Path $_ } | Select-Object -First 1
-    if ($found) { Copy-Item $found $cli; Write-Host "$c <- $found" }
+# 3b. no .NET exe may be CET-compatible (Directory.Build.props): the flag is bit 0 of the data of the debug directory entry of
+#     type 20 (IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS). PE32+: the debug directory is data directory 6, at optional header + 160.
+foreach ($exe in "SCSKiller.exe", "cli\scskiller.exe", "cli\scskillerw.exe") {
+    $b = [IO.File]::ReadAllBytes((Join-Path $out $exe))
+    $pe = [BitConverter]::ToInt32($b, 0x3C)
+    $opt = $pe + 24
+    $sections = $opt + [BitConverter]::ToUInt16($b, $pe + 20)
+    $rva = [BitConverter]::ToUInt32($b, $opt + 160)
+    $size = [BitConverter]::ToUInt32($b, $opt + 164)
+    $dir = $null
+    for ($i = 0; $i -lt [BitConverter]::ToUInt16($b, $pe + 6); $i++) {
+        $s = $sections + 40 * $i
+        $va = [BitConverter]::ToUInt32($b, $s + 12)
+        if ($rva -ge $va -and $rva -lt $va + [BitConverter]::ToUInt32($b, $s + 16)) { $dir = $rva - $va + [BitConverter]::ToUInt32($b, $s + 20) }
+    }
+    if ($null -eq $dir) { throw "${exe}: no debug directory" }
+    for ($e = $dir; $e -lt $dir + $size; $e += 28) {
+        if ([BitConverter]::ToUInt32($b, $e + 12) -eq 20 -and ([BitConverter]::ToUInt32($b, [BitConverter]::ToUInt32($b, $e + 24)) -band 1)) {
+            throw "$exe is CET-compatible: .NET would fail-fast at start on Windows 10 builds without CET special APCs"
+        }
+    }
 }
-if ($codecs | Where-Object { -not (Test-Path (Join-Path $cli $_)) }) { Run (Join-Path $cli "scskiller.exe") @("fetch-codecs") }
-if ($NoOodle) { Remove-Item (Join-Path $cli "oodle-data-shared.dll") -ErrorAction SilentlyContinue }   # fetch-codecs fetches both
-foreach ($c in $codecs) { Copy-Item (Join-Path $cli $c) $out }
+
+# 4. codecs next to both executables (UnrealReader loads them from AppContext.BaseDirectory), from a build-owned cache,
+#    never the app's data folder: fetch-codecs keeps the pinned copies there (Codecs.Pinned), downloads one that is
+#    missing or doesn't match, and fails the build when no copy matches
+$codecs = @(if (-not $NoOodle) { "oodle-data-shared.dll" }) + "zlib-ng2.dll"
+$cache = Join-Path ([Environment]::GetFolderPath("LocalApplicationData")) "SCSKiller-build\codecs"
+Run (Join-Path $cli "scskiller.exe") @("fetch-codecs", $cache)
+foreach ($c in $codecs) { Copy-Item (Join-Path $cache $c) $cli; Copy-Item (Join-Path $cache $c) $out }
+
+# 4a. the VC++ runtime next to both executables: libsodium and the codecs import vcruntime140.dll and Windows doesn't
+#     ship it (step 5 checks every import). App-local copies from this machine's Visual Studio redist (VC\redist is
+#     distributable code, Redist.txt), Microsoft-signed, never the system's.
+$vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+$vs = & $vswhere -latest -products "*" -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+if (-not $vs) { throw "no Visual Studio with the x64 C++ tools (vswhere): the VC++ runtime DLLs come from its redist" }
+$vsVersion = & $vswhere -path $vs -property installationVersion
+$redistVersion = (Get-Content (Join-Path $vs "VC\Auxiliary\Build\Microsoft.VCRedistVersion.default.txt") -TotalCount 1).Trim()
+$crt = @(Get-ChildItem (Join-Path $vs "VC\Redist\MSVC\$redistVersion\x64") -Directory -Filter "Microsoft.VC14*.CRT")
+if ($crt.Count -ne 1) { throw "VC\Redist\MSVC\$redistVersion\x64 has $($crt.Count) Microsoft.VC14*.CRT folders, not one" }
+$crtFiles = foreach ($f in "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll") {
+    $p = Join-Path $crt[0].FullName $f
+    $sig = Get-AuthenticodeSignature $p
+    if ($sig.Status -ne "Valid" -or $sig.SignerCertificate.Subject -notmatch '(^|, )O=Microsoft Corporation(,|$)') { throw "$p isn't signed by Microsoft ($($sig.Status))" }
+    $p
+}
+# the redist folder name can lag the DLLs' own version, so the shipped files are the record
+$crtVersions = @($crtFiles | ForEach-Object { $v = (Get-Item $_).VersionInfo; "$($v.FileMajorPart).$($v.FileMinorPart).$($v.FileBuildPart).$($v.FilePrivatePart)" } | Sort-Object -Unique)
+if ($crtVersions.Count -ne 1) { throw "the VC++ runtime DLLs in $($crt[0].FullName) differ in version: $($crtVersions -join ', ')" }
+$crtVersion = $crtVersions[0]
+foreach ($d in $out, $cli) { Copy-Item $crtFiles $d }
+$crtSource = "VC\Redist\MSVC\$redistVersion\x64\$($crt[0].Name)"
+Write-Host "VC++ runtime $crtVersion (app-local): $($crt[0].FullName)"
+[IO.File]::WriteAllText((Join-Path $out "VC-REDIST.txt"), "Microsoft Visual C++ runtime $crtVersion (x64), app-local next to SCSKiller.exe and cli\scskiller.exe: " +
+    "$(($crtFiles | Split-Path -Leaf) -join ', ')`r`nFrom Visual Studio $vsVersion, $crtSource`r`n")
 
 # 4b. licences: our notices and licence (GPL-3.0-or-later + the section 7 permission), plus the large notice files of the Microsoft packages as shipped
-Copy-Item (Join-Path $repo "THIRD-PARTY-NOTICES.md") $out
 foreach ($l in "LICENSE", "LICENSE-EXCEPTION.txt") { Copy-Item (Join-Path $repo $l) $out }
 $nuget = if ($env:NUGET_PACKAGES) { $env:NUGET_PACKAGES } else { Join-Path $env:USERPROFILE ".nuget\packages" }
 New-Item -ItemType Directory -Force (Join-Path $out "notices") | Out-Null
 # versions come from what was actually published (any SDK/runtime of this major or newer builds it)
 $runtime = ((Get-Content (Join-Path $out "SCSKiller.runtimeconfig.json") -Raw | ConvertFrom-Json).runtimeOptions.includedFrameworks |
     Where-Object name -eq "Microsoft.NETCore.App").version
-$libs = (Get-Content (Join-Path $repo "src\SCSKiller.App\obj\project.assets.json") -Raw | ConvertFrom-Json).libraries.PSObject.Properties.Name   # the restore that built it
+$row = "| .NET runtime (self-contained) |"
+$notices = [IO.File]::ReadAllText((Join-Path $repo "THIRD-PARTY-NOTICES.md")) -replace "(?m)^$([regex]::Escape($row)) [^|]* \|", "$row $runtime |"
+if (-not $notices.Contains("$row $runtime |")) { throw "THIRD-PARTY-NOTICES.md has no $row row to put .NET $runtime in" }
+$row = "| Microsoft Visual C++ runtime (vcruntime140.dll, vcruntime140_1.dll, msvcp140.dll) |"
+$notices = $notices -replace "(?m)^$([regex]::Escape($row)) [^|]* \|", "$row $crtVersion |"
+if (-not $notices.Contains("$row $crtVersion |")) { throw "THIRD-PARTY-NOTICES.md has no $row row to put $crtVersion in" }
+[IO.File]::WriteAllText((Join-Path $out "THIRD-PARTY-NOTICES.md"), $notices, [Text.UTF8Encoding]::new($true))
+$libs = (Get-Content (Join-Path $repo "src\SCSKiller.Ui\obj\project.assets.json") -Raw | ConvertFrom-Json).libraries.PSObject.Properties.Name   # the restore that built it
 function PackageVersion($id) {
     $v = $libs | Where-Object { $_ -like "$id/*" } | Select-Object -First 1
     if (-not $v) { throw "$id is not among the app's restored packages" }
@@ -102,25 +184,30 @@ function PackageVersion($id) {
 foreach ($n in @(
         @("microsoft.netcore.app.runtime.win-x64\$runtime\THIRD-PARTY-NOTICES.TXT", "dotnet-THIRD-PARTY-NOTICES.txt"),
         @("microsoft.windowsappsdk.runtime\$(PackageVersion 'Microsoft.WindowsAppSDK.Runtime')\NOTICE.txt", "WindowsAppSDK-NOTICE.txt"),
-        @("microsoft.windowsappsdk.winui\$(PackageVersion 'Microsoft.WindowsAppSDK.WinUI')\NOTICE.txt", "WinUI-NOTICE.txt"),
-        @("microsoft.web.webview2\$(PackageVersion 'Microsoft.Web.WebView2')\NOTICE.txt", "WebView2-NOTICE.txt"),
+        @("skiasharp.nativeassets.win32\$(PackageVersion 'SkiaSharp.NativeAssets.Win32')\THIRD-PARTY-NOTICES.txt", "SkiaSharp-THIRD-PARTY-NOTICES.txt"),
+        @("harfbuzzsharp.nativeassets.win32\$(PackageVersion 'HarfBuzzSharp.NativeAssets.Win32')\THIRD-PARTY-NOTICES.txt", "HarfBuzzSharp-THIRD-PARTY-NOTICES.txt"),
         @("communitytoolkit.highperformance\$(PackageVersion 'CommunityToolkit.HighPerformance')\ThirdPartyNotices.txt", "CommunityToolkit-ThirdPartyNotices.txt"))) {
     Copy-Item (Join-Path $nuget $n[0].ToLowerInvariant()) (Join-Path $out "notices\$($n[1])")   # THIRD-PARTY-NOTICES.md lists the versions shipped
 }
 
 # 5. layout check, including self-contained .NET (no "install .NET" prompt): the runtime next to each exe and
 #    runtimeconfig.json listing includedFrameworks rather than a shared framework
-$expected = "SCSKiller.exe", "oodle-data-shared.dll", "zlib-ng2.dll", "cli\scskiller.exe", "cli\scskillerw.exe",
-    "cli\oodle-data-shared.dll", "cli\zlib-ng2.dll", "native\scskiller_warm.exe", "native\segheap\scskiller_warm.exe", "native\d3d12.dll", "native\amd_ags_x64.dll",
-    "hostfxr.dll", "coreclr.dll", "cli\hostfxr.dll", "cli\coreclr.dll", "Microsoft.WindowsAppRuntime.dll", "SCSKiller.pri",
-    "THIRD-PARTY-NOTICES.md", "LICENSE", "LICENSE-EXCEPTION.txt", "notices\dotnet-THIRD-PARTY-NOTICES.txt"
+$expected = "SCSKiller.exe", "oodle-data-shared.dll", "zlib-ng2.dll", "vcruntime140.dll", "VC-REDIST.txt", "cli\scskiller.exe", "cli\scskillerw.exe", "cli\vcruntime140.dll",
+    "cli\oodle-data-shared.dll", "cli\zlib-ng2.dll", "native\scskiller_warm.exe", "native\segheap\scskiller_warm.exe", "native\d3d12.dll", "native\amd_ags_x64.dll", "native\scskiller_ags.dll", "native\fossilize-replay.exe",
+    "native\VkLayer_scskiller.dll", "native\d3d9.dll", "native\x86\d3d9.dll", "native\preload\winmm.dll", "native\preload\version.dll", "native\preload\dinput8.dll",
+    "hostfxr.dll", "coreclr.dll", "cli\hostfxr.dll", "cli\coreclr.dll", "Microsoft.WindowsAppRuntime.dll",
+    "Microsoft.WindowsAppRuntime.Insights.Resource.dll", "libSkiaSharp.dll", "libHarfBuzzSharp.dll", "av_libglesv2.dll",
+    "THIRD-PARTY-NOTICES.md", "LICENSE", "LICENSE-EXCEPTION.txt", "notices\dotnet-THIRD-PARTY-NOTICES.txt",
+    "notices\SkiaSharp-THIRD-PARTY-NOTICES.txt", "notices\HarfBuzzSharp-THIRD-PARTY-NOTICES.txt"
 if ($NoOodle) { $expected = $expected | Where-Object { $_ -notlike "*oodle-data-shared.dll" } }
 $missing = $expected | Where-Object { -not (Test-Path (Join-Path $out $_)) }
 if ($missing) { throw "dist\SCSKiller is missing: $($missing -join ', ')" }
 if ($NoOodle -and (Get-ChildItem $out -Recurse -Filter "oodle-data-shared.dll")) { throw "-NoOodle, but oodle-data-shared.dll is in dist\SCSKiller" }
+if (Get-ChildItem $out -Recurse -Filter "*.pdb") { throw "debug symbols must not be published" }
 foreach ($rc in "SCSKiller.runtimeconfig.json", "cli\scskiller.runtimeconfig.json") {
     if ((Get-Content (Join-Path $out $rc) -Raw) -notmatch '"includedFrameworks"') { throw "$rc is framework-dependent" }
 }
+& (Join-Path $PSScriptRoot "check-vcruntime.ps1") -Dir $out
 
 # 6. zip (with the SCSKiller\ folder at its root)
 if (-not $NoZip) {
@@ -129,6 +216,8 @@ if (-not $NoZip) {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     [IO.Compression.ZipFile]::CreateFromDirectory($out, $zip, [IO.Compression.CompressionLevel]::Optimal, $true)
 }
+# 7. no game key in the published files or the zip
+KeyScan (@($out) + @(if (-not $NoZip) { $zip }))
 $msg = "dist\SCSKiller: {0:N0} MB" -f ((Get-ChildItem $out -Recurse -File | Measure-Object Length -Sum).Sum / 1MB)
 if (-not $NoZip) { $msg += ", dist\SCSKiller.zip: {0:N0} MB" -f ((Get-Item $zip).Length / 1MB) }
 Write-Host $msg

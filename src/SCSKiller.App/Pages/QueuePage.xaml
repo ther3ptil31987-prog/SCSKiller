@@ -16,6 +16,10 @@
             <Setter Property="Padding" Value="8,0" />
             <Setter Property="VerticalAlignment" Value="Center" />
         </Style>
+        <Style x:Key="RowItem" TargetType="ListViewItem" BasedOn="{StaticResource DefaultListViewItemStyle}">
+            <Setter Property="Padding" Value="16,0" />
+            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+        </Style>
     </Page.Resources>
 
     <!-- Every row uses the same columns as the header: handle, number, icon, game, time, cache, actions. -->
@@ -31,11 +35,12 @@
                     <TextBlock Text="{x:Bind Vm.Summary, Mode=OneWay}" Style="{StaticResource Secondary}" />
                     <TextBlock Text="{x:Bind Vm.PlanChecks, Mode=OneWay}" Visibility="{x:Bind Vm.HasPlanChecks, Mode=OneWay}" Style="{StaticResource Caption}"
                                ToolTipService.ToolTip="After an update SCSKiller rebuilds the plans of compiled games in the background, without compiling. A game with more to compile shows it in the Library." />
+                    <HyperlinkButton Content="Check now" Click="OnCheckNow" Padding="0" Visibility="{x:Bind Vm.HasPlanChecks, Mode=OneWay}" IsEnabled="{x:Bind Vm.CanCheckNow, Mode=OneWay}" />
                     <TextBlock Text="Compiles run outside the game, under the game's name. Keep the game closed while it runs."
                                Style="{StaticResource Caption}" TextWrapping="Wrap" />
                 </StackPanel>
                 <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="12" VerticalAlignment="Bottom">
-                    <Button Style="{StaticResource AccentButtonStyle}" Click="OnStart"
+                    <Button Style="{StaticResource AccentButtonStyle}" Click="OnStart" AutomationProperties.Name="Compile queue"
                             Visibility="{x:Bind Vm.Idle, Mode=OneWay}" IsEnabled="{x:Bind Vm.CanStart, Mode=OneWay}">
                         <StackPanel Orientation="Horizontal" Spacing="8">
                             <FontIcon Glyph="&#xE945;" FontSize="14" />
@@ -43,15 +48,17 @@
                         </StackPanel>
                     </Button>
                     <Button Content="{x:Bind Vm.PauseText, Mode=OneWay}" Click="OnPause" Visibility="{x:Bind Vm.HasCurrent, Mode=OneWay}" />
-                    <Button Content="Stop" Click="OnStop" Visibility="{x:Bind Vm.HasCurrent, Mode=OneWay}"
+                    <Button Content="Stop" Click="OnStop" Visibility="{x:Bind Vm.CanStop, Mode=OneWay}"
                             ToolTipService.ToolTip="Finishes the compiles in flight, then stops. Add the game again to continue where it stopped." />
                 </StackPanel>
             </Grid>
 
+            <InfoBar Severity="Warning" IsClosable="False" IsOpen="{x:Bind Vm.RuntimeWarn, Mode=OneWay}" Visibility="{x:Bind Vm.RuntimeWarn, Mode=OneWay}"
+                     Message="{x:Bind Vm.RuntimeWarnText, Mode=OneWay}" />
             <InfoBar Severity="Warning" IsClosable="False" IsOpen="{x:Bind Vm.CacheWarn, Mode=OneWay}" Visibility="{x:Bind Vm.CacheWarn, Mode=OneWay}"
                      Message="{x:Bind Vm.CacheWarnText, Mode=OneWay}">
                 <InfoBar.ActionButton>
-                    <HyperlinkButton Content="Raise the limit" Click="OnSettings" Visibility="{x:Bind Vm.CanRaiseLimit}" />
+                    <HyperlinkButton Content="Raise the limit" Click="OnSettings" Visibility="{x:Bind Vm.CanRaiseLimit, Mode=OneWay}" />
                 </InfoBar.ActionButton>
             </InfoBar>
 
@@ -65,11 +72,18 @@
                             <ColumnDefinition MinWidth="160" />
                             <ColumnDefinition Width="96" />
                             <ColumnDefinition Width="80" />
-                            <ColumnDefinition Width="216" />
+                            <ColumnDefinition Width="320" />
                         </Grid.ColumnDefinitions>
                         <TextBlock Grid.Column="1" Grid.ColumnSpan="3" Text="Game (in run order)" Style="{StaticResource Caption}" VerticalAlignment="Center" />
                         <TextBlock Grid.Column="4" Text="Time" Style="{StaticResource Caption}" TextAlignment="Right" VerticalAlignment="Center" />
                         <TextBlock Grid.Column="5" Text="Cache" Style="{StaticResource Caption}" TextAlignment="Right" VerticalAlignment="Center" />
+                        <StackPanel Grid.Column="6" Orientation="Horizontal" HorizontalAlignment="Right" Visibility="{x:Bind Vm.CanClear, Mode=OneWay}">
+                            <!-- tooltip on a hit-testable wrapper: a disabled button shows none -->
+                            <Grid Background="Transparent" ToolTipService.ToolTip="Ctrl+click or Shift+click to select several games">
+                                <HyperlinkButton x:Name="RemoveSelected" Content="Remove selected" FontSize="12" IsEnabled="False" Click="OnRemoveSelected" />
+                            </Grid>
+                            <HyperlinkButton Content="Clear queue" FontSize="12" Click="OnClearQueue" ToolTipService.ToolTip="Removes every game but the one compiling" />
+                        </StackPanel>
                     </Grid>
                     <Rectangle Height="1" Fill="{ThemeResource CardStrokeColorDefaultBrush}" />
 
@@ -88,7 +102,7 @@
                             <ColumnDefinition MinWidth="160" />
                             <ColumnDefinition Width="96" />
                             <ColumnDefinition Width="80" />
-                            <ColumnDefinition Width="216" />
+                            <ColumnDefinition Width="320" />
                         </Grid.ColumnDefinitions>
                         <Grid.RowDefinitions>
                             <RowDefinition />
@@ -120,14 +134,10 @@
                                      IsIndeterminate="{x:Bind Vm.Indeterminate, Mode=OneWay}" AutomationProperties.Name="Compile progress" />
                     </Grid>
 
-                    <ListView ItemsSource="{x:Bind Vm.Waiting}" SelectionMode="None" CanDragItems="True" CanReorderItems="True" AllowDrop="True"
-                              DragItemsStarting="OnDragStarting" DragItemsCompleted="OnDragCompleted" AutomationProperties.Name="Waiting games">
-                        <ListView.ItemContainerStyle>
-                            <Style TargetType="ListViewItem" BasedOn="{StaticResource DefaultListViewItemStyle}">
-                                <Setter Property="Padding" Value="16,0" />
-                                <Setter Property="HorizontalContentAlignment" Value="Stretch" />
-                            </Style>
-                        </ListView.ItemContainerStyle>
+                    <ListView x:Name="WaitingList" ItemsSource="{x:Bind Vm.Waiting}" SelectionMode="Extended" SelectionChanged="OnSelection"
+                              CanDragItems="True" CanReorderItems="True" AllowDrop="True"
+                              DragItemsStarting="OnDragStarting" DragItemsCompleted="OnDragCompleted" AutomationProperties.Name="Waiting games"
+                              ItemContainerStyle="{StaticResource RowItem}">
                         <ListView.ItemTemplate>
                             <DataTemplate x:DataType="local:QueueRow">
                                 <Grid ColumnSpacing="12" MinHeight="56">
@@ -138,7 +148,7 @@
                                         <ColumnDefinition MinWidth="160" />
                                         <ColumnDefinition Width="96" />
                                         <ColumnDefinition Width="80" />
-                                        <ColumnDefinition Width="216" />
+                                        <ColumnDefinition Width="320" />
                                     </Grid.ColumnDefinitions>
                                     <FontIcon Glyph="&#xE76F;" FontSize="14" Foreground="{ThemeResource TextFillColorTertiaryBrush}" ToolTipService.ToolTip="Drag to reorder" />
                                     <Border Grid.Column="1" Width="24" Height="24" CornerRadius="12" Background="{ThemeResource ControlFillColorSecondaryBrush}">
@@ -160,6 +170,8 @@
                                     <StackPanel Grid.Column="6" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="2">
                                         <Button Content="Move to top" Style="{StaticResource RowButton}" FontSize="13" IsEnabled="{x:Bind CanUp}" Click="OnTop"
                                                 AutomationProperties.Name="{x:Bind TopLabel}" />
+                                        <Button Content="Move to bottom" Style="{StaticResource RowButton}" FontSize="13" IsEnabled="{x:Bind CanDown}" Click="OnBottom"
+                                                AutomationProperties.Name="{x:Bind BottomLabel}" />
                                         <Button Style="{StaticResource RowButton}" Padding="0" IsEnabled="{x:Bind CanUp}" Click="OnUp"
                                                 AutomationProperties.Name="{x:Bind UpLabel}" ToolTipService.ToolTip="Move up">
                                             <FontIcon Glyph="&#xE70E;" FontSize="14" />
@@ -184,10 +196,11 @@
                             <TextBlock Text="Finished" Style="{StaticResource Caption}" VerticalAlignment="Center" />
                             <HyperlinkButton Content="Clear finished" HorizontalAlignment="Right" FontSize="12" Click="OnClearFinished" />
                         </Grid>
-                        <ItemsControl ItemsSource="{x:Bind Vm.Finished}" IsTabStop="False">
-                            <ItemsControl.ItemTemplate>
+                        <ListView ItemsSource="{x:Bind Vm.Finished}" SelectionMode="None" IsItemClickEnabled="True" ItemClick="OnGameClick"
+                                  ItemContainerStyle="{StaticResource RowItem}" AutomationProperties.Name="Finished games">
+                            <ListView.ItemTemplate>
                                 <DataTemplate x:DataType="local:QueueRow">
-                                    <Grid Margin="16,0" ColumnSpacing="12" MinHeight="48">
+                                    <Grid ColumnSpacing="12" MinHeight="48">
                                         <Grid.ColumnDefinitions>
                                             <ColumnDefinition Width="16" />
                                             <ColumnDefinition Width="24" />
@@ -195,7 +208,7 @@
                                             <ColumnDefinition MinWidth="160" />
                                             <ColumnDefinition Width="96" />
                                             <ColumnDefinition Width="80" />
-                                            <ColumnDefinition Width="216" />
+                                            <ColumnDefinition Width="320" />
                                         </Grid.ColumnDefinitions>
                                         <FontIcon Grid.Column="1" Glyph="{x:Bind Glyph}" FontSize="14" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                                         <Grid Grid.Column="2" Width="32" Height="32" Opacity="0.55">
@@ -217,8 +230,8 @@
                                         </Button>
                                     </Grid>
                                 </DataTemplate>
-                            </ItemsControl.ItemTemplate>
-                        </ItemsControl>
+                            </ListView.ItemTemplate>
+                        </ListView>
                     </StackPanel>
                 </StackPanel>
             </Border>

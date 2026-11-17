@@ -8,19 +8,21 @@ namespace SCSKiller.Core.Games;
 /// package-manager query is needed to enumerate installs: the manifest sits right there in Content, readable like
 /// any other file since the 2022 Xbox app. It's only used, via the native PackageFamilyNameFromId (below), to turn
 /// the manifest's Identity name+publisher into the same PackageFamilyName Get-AppxPackage would show, for the id.</summary>
-public sealed class XboxSource(IEnumerable<string>? driveRoots = null) : IGameSource
+public sealed class XboxSource(IEnumerable<string>? driveRoots = null) : IGameSource, ILeavesOut
 {
     public Store Store => Store.Xbox;
 
-    /// <summary>Games listed before, by id: the exe a config names none for is reused while the game's version and folder
-    /// are the same and the exe is there.</summary>
+    public Func<string, bool> LeftOut { get; set; } = _ => false;
+
+    /// <summary>Games listed before, by id: the exe found below Content for a game whose config and Content folder name none
+    /// is reused while the game's version and folder are the same and the exe is there.</summary>
     public IReadOnlyDictionary<string, Game>? Known { get; set; }
 
     public IReadOnlyList<Game> Discover()
     {
         var games = new List<Game>();
         var roots = driveRoots ?? DriveInfo.GetDrives().Where(d => d.DriveType is DriveType.Fixed or DriveType.Removable).Select(d => d.RootDirectory.FullName);
-        foreach (var root in roots.SelectMany(LibraryFolders).Distinct(StringComparer.OrdinalIgnoreCase))
+        foreach (var root in roots.Where(r => !LeftOut(r)).SelectMany(LibraryFolders).Where(l => !LeftOut(l)).Distinct(StringComparer.OrdinalIgnoreCase))
         {
             IEnumerable<string> titleDirs;
             try { titleDirs = Directory.Exists(root) ? Directory.GetDirectories(root) : []; }
@@ -28,13 +30,14 @@ public sealed class XboxSource(IEnumerable<string>? driveRoots = null) : IGameSo
             foreach (var titleDir in titleDirs)
             {
                 var content = Path.Combine(titleDir, "Content");
+                if (LeftOut(content)) continue;
                 var configPath = Path.Combine(content, "MicrosoftGame.config");
                 if (!File.Exists(configPath)) continue;
                 try
                 {
                     if (ParseGame(content, configPath, Known) is { } game) games.Add(game);
                 }
-                catch (Exception) { }   // a config we can't read/parse shouldn't take the rest of the scan down
+                catch (Exception e) when (e is not OperationCanceledException) { GameFiles.Skip("Xbox", configPath, e); }
             }
         }
         return games;
@@ -94,8 +97,9 @@ public sealed class XboxSource(IEnumerable<string>? driveRoots = null) : IGameSo
             .Where(IsGameExecutable)
             .Select(e => e.Attribute("Name")?.Value)
             .FirstOrDefault(n => n != null)
+            ?? RootExe(content)
             ?? (known?.GetValueOrDefault($"xbox:{familyName ?? name}") is { Version: { } was } k && was == version && k.InstallDir.Equals(content, StringComparison.OrdinalIgnoreCase)
-                && File.Exists(k.ExePath) ? k.ExePath : FindExeFallback(content));
+                && File.Exists(k.ExePath) && Pickable(k.ExePath) ? k.ExePath : FindExeFallback(content));
         if (exeRel == null) return null;
         var exe = Path.GetFullPath(Path.Combine(content, exeRel));
 
@@ -112,24 +116,59 @@ public sealed class XboxSource(IEnumerable<string>? driveRoots = null) : IGameSo
     static readonly string[] HelperHints =
         ["launch", "bootstrap", "helper", "crash", "webview", "uploader", "gpudetection", "hashdatabase", "setup", "redist", "unins", "reporter", "cache_builder"];
 
+    /// <summary>The exes an Xbox app game's MicrosoftGame.config lists as not the game (dev-only, another device family, a
+    /// helper), full paths; none without a config that can be read.</summary>
+    internal static HashSet<string> NotTheGame(string content)
+    {
+        var config = Path.Combine(content, "MicrosoftGame.config");
+        try
+        {
+            if (!File.Exists(config)) return [];
+            var doc = XDocument.Load(config);
+            var ns = doc.Root!.GetDefaultNamespace();
+            return (doc.Root.Element(ns + "ExecutableList")?.Elements(ns + "Executable") ?? []).Where(e => !IsGameExecutable(e))
+                .Select(e => e.Attribute("Name")?.Value).OfType<string>().Select(n => Path.GetFullPath(GameFiles.Under(content, n)))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Xml.XmlException or ArgumentException or NotSupportedException) { return []; }
+    }
+
     static bool IsGameExecutable(XElement e)
     {
         var n = e.Attribute("Name")?.Value;
-        if (n == null || HelperHints.Any(h => n.Contains(h, StringComparison.OrdinalIgnoreCase))) return false;
+        if (n == null || LauncherOrUtility(n)) return false;
         var family = e.Attribute("TargetDeviceFamily")?.Value;
         if (family != null && !family.Contains("PC", StringComparison.OrdinalIgnoreCase)) return false;
         return !string.Equals(e.Attribute("IsDevOnly")?.Value, "true", StringComparison.OrdinalIgnoreCase);
     }
 
-    /// <summary>No config entry survived the helper filter (e.g. Darktide's config lists only its launcher): pick
-    /// the largest non-helper-named exe under Content.</summary>
+    /// <summary>No config entry survived the helper filter: the largest non-helper exe in Content itself, as the game it is
+    /// (an Unreal stub's Shipping exe, an EasyAntiCheat bootstrap's target). DOOM Eternal's config names only its launcher,
+    /// and its mod sandbox in a subfolder is larger than the game in the root.</summary>
+    static string? RootExe(string content)
+    {
+        var excluded = NotTheGame(content);
+        var exe = Directory.EnumerateFiles(content, "*.exe", new EnumerationOptions { IgnoreInaccessible = true, AttributesToSkip = 0 })
+            .Where(f => Pickable(f) && !excluded.Contains(Path.GetFullPath(f)))
+            .Select(f => new FileInfo(f)).MaxBy(f => f.Length)?.FullName;
+        return exe == null ? null : GameFiles.GameExe(content, exe);
+    }
+
+    /// <summary>Nothing in Content itself either (e.g. Darktide's config lists only its launcher): the largest non-helper
+    /// exe under Content.</summary>
     static string? FindExeFallback(string content)
     {
-        var opts = new EnumerationOptions { RecurseSubdirectories = true, MaxRecursionDepth = 3, IgnoreInaccessible = true };
+        var opts = new EnumerationOptions { RecurseSubdirectories = true, MaxRecursionDepth = 3, IgnoreInaccessible = true, AttributesToSkip = 0 };
+        var excluded = NotTheGame(content);
         return Directory.EnumerateFiles(content, "*.exe", opts)
-            .Where(f => !HelperHints.Any(h => Path.GetFileName(f).Contains(h, StringComparison.OrdinalIgnoreCase)) && !GameFiles.IsHelper(f))
+            .Where(f => Pickable(f) && !GameFiles.NotTheGameExe(content, f, excluded))
             .Select(f => new FileInfo(f)).MaxBy(f => f.Length)?.FullName;
     }
+
+    static bool Pickable(string exe) => !LauncherOrUtility(Path.GetFileName(exe)) && !GameFiles.IsHelper(exe);
+
+    /// <summary>A launcher's or utility's exe by its name (<see cref="HelperHints"/>).</summary>
+    internal static bool LauncherOrUtility(string name) => HelperHints.Any(h => name.Contains(h, StringComparison.OrdinalIgnoreCase));
 
     /// <summary>"&lt;package family&gt;!&lt;app id&gt;" of an Xbox game (its Content\appxmanifest.xml), null for any other game.</summary>
     public static string? AppUserModelId(Game g)
@@ -143,6 +182,41 @@ public sealed class XboxSource(IEnumerable<string>? driveRoots = null) : IGameSo
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Xml.XmlException) { return null; }
     }
+
+    /// <summary>The path an Xbox game's process runs from: its exe under the package's install folder
+    /// (<c>C:\Program Files\WindowsApps\&lt;full name&gt;</c>), not under Content. Null when no installed package holds it.</summary>
+    public static string? LaunchPath(Game g)
+    {
+        if (g.Store != Store.Xbox || !g.Id.StartsWith("xbox:", StringComparison.Ordinal)) return null;
+        var family = g.Id["xbox:".Length..];
+        var rel = Path.GetRelativePath(g.InstallDir, g.ExePath);
+        uint count = 0, len = 0;
+        GetPackagesByPackageFamily(family, ref count, null, ref len, 0);
+        if (count == 0 || len == 0) return null;
+        var names = new nint[count];
+        var buf = Marshal.AllocHGlobal((int)len * sizeof(char));
+        try
+        {
+            if (GetPackagesByPackageFamily(family, ref count, names, ref len, buf) != 0) return null;
+            foreach (var full in names.Take((int)count).Select(p => Marshal.PtrToStringUni(p)))
+            {
+                uint plen = 0;
+                GetPackagePathByFullName(full!, ref plen, null);
+                if (plen == 0) continue;
+                var path = new char[plen];
+                if (GetPackagePathByFullName(full!, ref plen, path) == 0 && Path.Combine(new string(path, 0, (int)plen - 1), rel) is var exe && File.Exists(exe))
+                    return exe;
+            }
+            return null;
+        }
+        finally { Marshal.FreeHGlobal(buf); }
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    static extern int GetPackagesByPackageFamily(string packageFamilyName, ref uint count, [Out] nint[]? packageFullNames, ref uint bufferLength, nint buffer);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    static extern int GetPackagePathByFullName(string packageFullName, ref uint pathLength, [Out] char[]? path);
 
     // PackageFamilyNameFromId (appmodel.h)
     [StructLayout(LayoutKind.Sequential)]

@@ -16,11 +16,18 @@ public static class ContentFile
         RespectNullableAnnotations = true, RespectRequiredConstructorParameters = true,
     };
 
-    /// <summary>The document when it is within <see cref="MaxBytes"/> and valid JSON of <typeparamref name="T"/>'s shape; else null.</summary>
-    public static T? Read<T>(string json) where T : class
+    /// <summary>The document when it is within <paramref name="maxBytes"/> (<see cref="MaxBytes"/>) and valid JSON of <typeparamref name="T"/>'s shape; else null.</summary>
+    public static T? Read<T>(string json, int maxBytes = MaxBytes) where T : class
     {
-        if (System.Text.Encoding.UTF8.GetByteCount(json) > MaxBytes) return null;
+        if (System.Text.Encoding.UTF8.GetByteCount(json) > maxBytes) return null;
         try { return JsonSerializer.Deserialize<T>(json, Strict); }
+        catch (JsonException) { return null; }
+    }
+
+    /// <summary>One element of a document read with the same strictness; null when it doesn't have <typeparamref name="T"/>'s shape.</summary>
+    public static T? Read<T>(JsonElement e) where T : class
+    {
+        try { return e.Deserialize<T>(Strict); }
         catch (JsonException) { return null; }
     }
 
@@ -43,6 +50,13 @@ public static class ContentFile
     {
         if (await (routes ?? RouteFailover.Default).GetContentAsync(path, budget ?? TimeSpan.FromSeconds(3), MaxBytes) is not { } json
             || parse(json) is not { } list) return null;
+        Keep(cacheFile, json);
+        return list;
+    }
+
+    /// <summary>A valid server copy to <paramref name="cacheFile"/>, for <see cref="Cached"/>.</summary>
+    public static void Keep(string cacheFile, string json)
+    {
         try
         {
             var tmp = cacheFile + ".tmp";
@@ -50,6 +64,5 @@ public static class ContentFile
             File.Move(tmp, cacheFile, overwrite: true);
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }   // used anyway; the next start fetches again
-        return list;
     }
 }

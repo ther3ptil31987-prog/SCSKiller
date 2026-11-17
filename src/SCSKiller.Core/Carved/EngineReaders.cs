@@ -1,9 +1,13 @@
+using SCSKiller.Core.Planning;
+
 namespace SCSKiller.Core.Carved;
 
-/// <summary>Several engine readers as one, tried in order. Detect: the first result that can be indexed, else the first
-/// reader's that recognized the game (its reason is the most specific, e.g. Unreal's "encrypted" over the carver's "packed").
+/// <summary>Several engine readers as one, tried in order. Detect: the first result that can be indexed, or that is
+/// encrypted with a fork a plan rule names (its key makes it compile, so it wins over the carver), else the first reader's
+/// that recognized the game (its reason is the most specific, e.g. Unreal's "encrypted" over the carver's "packed"). A reader
+/// that throws (the game holding its files) makes the readers after it count only when they can index the game.
 /// Index and ReadShaders go to the reader of <see cref="EngineInfo.Family"/>, so an EngineInfo cached from an earlier scan
-/// still finds its reader.</summary>
+/// still finds its reader. A reader listed under several families (the carver) is tried once.</summary>
 public sealed class EngineReaders(params (string Family, IEngineReader Reader)[] readers) : IEngineReader
 {
     public T? Get<T>() where T : class, IEngineReader => readers.Select(r => r.Reader).OfType<T>().FirstOrDefault();
@@ -12,28 +16,41 @@ public sealed class EngineReaders(params (string Family, IEngineReader Reader)[]
     {
         EngineInfo? first = null;
         Exception? error = null;
-        foreach (var (_, reader) in readers)
+        foreach (var reader in Distinct)
         {
             EngineInfo? e;
             try { e = reader.Detect(game); }
             catch (Exception ex) { error ??= ex; continue; } // one reader choking on the game's files doesn't stop the next
             if (e == null) continue;
-            if (e.Unsupported == null && !e.Encrypted) return e;
-            first ??= e;
+            if (e.Unsupported == null && !e.Encrypted || e.Encrypted && RulesFile.Current.RuleFor(e)?.Match.Fork != null) return e;
+            if (error == null) first ??= e;   // after a reader failed, a later one's "not supported" isn't the game's answer
         }
         if (first == null && error != null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(error);
         return first;
     }
 
-    public string IndexStamp(Game game) => string.Concat(readers.Select(r => r.Reader.IndexStamp(game)));
+    IEnumerable<IEngineReader> Distinct => readers.Select(r => r.Reader).Distinct();
 
-    public string DetectStamp(Game game, EngineInfo? engine) => engine == null ? string.Concat(readers.Select(r => r.Reader.DetectStamp(game, null)))
+    public string IndexStamp(Game game) => string.Concat(Distinct.Select(r => r.IndexStamp(game)));
+
+    public string IndexStamp(Game game, EngineInfo? engine) => string.Concat(Distinct.Select(r => r.IndexStamp(game, engine)));
+
+    public string DetectStamp(Game game, EngineInfo? engine) => engine == null ? string.Concat(Distinct.Select(r => r.DetectStamp(game, null)))
         : readers.FirstOrDefault(r => r.Family == engine.Family).Reader?.DetectStamp(game, engine) ?? "";
+
+    public int ReaderVersion(EngineInfo engine) => readers.FirstOrDefault(r => r.Family == engine.Family).Reader?.ReaderVersion(engine) ?? 1;
 
     IEngineReader Of(EngineInfo e) => readers.FirstOrDefault(r => r.Family == e.Family).Reader ?? throw new NotSupportedException($"no reader for {e.Family}");
 
-    public ShaderIndex Index(Game game, EngineInfo engine, IProgress<string>? log, CancellationToken ct) => Of(engine).Index(game, engine, log, ct);
+    public ShaderIndex Index(Game game, EngineInfo engine, IProgress<string>? log, CancellationToken ct) => Index(game, engine, log, null, ct);
 
-    public void ReadShaders(Game game, EngineInfo engine, IReadOnlySet<string> sha1s, Action<string, byte[]> sink, CancellationToken ct) =>
-        Of(engine).ReadShaders(game, engine, sha1s, sink, ct);
+    // a keyless game's files don't open: its recording is the whole plan, as a packed game's
+    public ShaderIndex Index(Game game, EngineInfo engine, IProgress<string>? log, IProgress<(int Done, int Total)>? progress, CancellationToken ct) =>
+        CarvedReader.Keyless(engine) ? new(ShaderIndex.EmptyContentHash, [CarvedReader.Platform], new Dictionary<string, ShaderInfo>(), [])
+        : Of(engine).Index(game, engine, log, progress, ct);
+
+    public void ReadShaders(Game game, EngineInfo engine, IReadOnlySet<string> sha1s, Action<string, byte[]> sink, CancellationToken ct)
+    {
+        if (!CarvedReader.Keyless(engine)) Of(engine).ReadShaders(game, engine, sha1s, sink, ct);
+    }
 }

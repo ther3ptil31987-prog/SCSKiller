@@ -10,14 +10,14 @@ namespace SCSKiller.Core.Unreal;
 public static class ShaderContainer
 {
     /// <summary>Offset of the first "DXBC" whose uint32 size at +24 fits in the blob, or -1.</summary>
-    public static int Offset(byte[] code, out int len)
+    public static int Offset(ReadOnlySpan<byte> code, out int len)
     {
         len = code.Length;
-        for (var i = code.AsSpan().IndexOf("DXBC"u8); i >= 0 && i + 28 <= code.Length;)
+        for (var i = code.IndexOf("DXBC"u8); i >= 0 && i + 28 <= code.Length;)
         {
-            var size = BitConverter.ToUInt32(code, i + 24);
+            var size = BitConverter.ToUInt32(code[(i + 24)..]);
             if (size >= 32 && i + size <= code.Length) { len = (int)size; return i; }
-            var next = code.AsSpan(i + 1).IndexOf("DXBC"u8);
+            var next = code[(i + 1)..].IndexOf("DXBC"u8);
             i = next < 0 ? -1 : i + 1 + next;
         }
         return -1;
@@ -62,13 +62,22 @@ public static class ShaderContainer
         readonly ConcurrentDictionary<string, ResourceCounts> wide = new();
         int votes;
 
-        public void See(byte[] code, ShaderInfo info)
+        /// <returns>the wide counts and the vote it cast, for <see cref="Restore"/>; null when the shader has no 10-byte 'p'</returns>
+        public (ResourceCounts Counts, int Vote)? See(byte[] code, ShaderInfo info)
         {
-            if (!OptionalData(code).TryGetValue('p', out var pc) || pc.Length != 10) return;
+            if (!OptionalData(code).TryGetValue('p', out var pc) || pc.Length != 10) return null;
             var w = new ResourceCounts(pc[4], pc[2] | pc[3] << 8, pc[5], pc[1]);
-            wide[info.Sha1] = w;
             var cbs = info.Bindings.Where(b => b.Class == "cbv" && b.Space == 0).Select(b => b.Lower + Math.Max(1, b.Count)).DefaultIfEmpty(0).Max();
-            if ((cbs == w.Cb) != (cbs == info.Counts.Cb)) Interlocked.Add(ref votes, cbs == w.Cb ? 1 : -1);
+            var vote = (cbs == w.Cb) == (cbs == info.Counts.Cb) ? 0 : cbs == w.Cb ? 1 : -1;
+            Restore(info.Sha1, w, vote);
+            return (w, vote);
+        }
+
+        /// <summary>What <see cref="See"/> of a shader found, from a read that saw it before (an inline read's checkpoint).</summary>
+        public void Restore(string sha1, ResourceCounts w, int vote)
+        {
+            wide[sha1] = w;
+            Interlocked.Add(ref votes, vote);
         }
 
         /// <returns>whether the wide layout won</returns>
@@ -77,6 +86,35 @@ public static class ShaderContainer
             if (votes <= 0) return false;
             foreach (var (h, w) in wide) shaders[h] = shaders[h] with { Counts = w };
             return true;
+        }
+    }
+
+    /// <summary>One read's shader model names, binding and signature lists, each kept once: a game's shaders repeat few of
+    /// them (High on Life: 34,215 shaders, 1,092 binding lists, 4,823 input signatures).</summary>
+    public sealed class SharedLists
+    {
+        readonly ConcurrentDictionary<IReadOnlyList<Binding>, IReadOnlyList<Binding>> bindings = new(Seq<Binding>.Instance);
+        readonly ConcurrentDictionary<IReadOnlyList<SigElement>, IReadOnlyList<SigElement>> sigs = new(Seq<SigElement>.Instance);
+        readonly ConcurrentDictionary<string, string> models = new();
+
+        public ShaderInfo Share(ShaderInfo s) => s with
+        {
+            ShaderModel = models.GetOrAdd(s.ShaderModel, s.ShaderModel),
+            Bindings = bindings.GetOrAdd(s.Bindings, s.Bindings),
+            Inputs = sigs.GetOrAdd(s.Inputs, s.Inputs),
+            Outputs = sigs.GetOrAdd(s.Outputs, s.Outputs),
+        };
+
+        sealed class Seq<T> : IEqualityComparer<IReadOnlyList<T>>
+        {
+            public static readonly Seq<T> Instance = new();
+            public bool Equals(IReadOnlyList<T>? a, IReadOnlyList<T>? b) => ReferenceEquals(a, b) || a != null && b != null && a.SequenceEqual(b);
+            public int GetHashCode(IReadOnlyList<T> list)
+            {
+                var h = new HashCode();
+                foreach (var x in list) h.Add(x);
+                return h.ToHashCode();
+            }
         }
     }
 
@@ -110,6 +148,32 @@ public static class ShaderContainer
     /// at this register plus their row: their rows count from 0, and a PS packs them after its own per-vertex inputs.</summary>
     public const int PrimitiveRow = 0x10000;
 
+    /// <summary>Signature elements a part may hold (the runtime's limit is 32 registers x 4 components per stream): more is a
+    /// malformed container (ArgumentException).</summary>
+    public const int MaxSigElements = 1024;
+
+    /// <summary>Bytes of distinct names a container's part may decode: its distinct names fit in it, so more means names
+    /// that overlap (each a suffix of a longer one) and would decode into far more strings than the part holds.</summary>
+    internal static long NameBudget(int partLength) => 2L * partLength + (64 << 10);
+
+    /// <summary>Length of a signature semantic, and the decoded bytes of distinct semantics one signature part may hold (128
+    /// elements per stream at that length): more is a malformed container. The longest system value, SV_RenderTargetArrayIndex,
+    /// has 25. RDAT function names have no such cap: DXC writes them unabbreviated.</summary>
+    public const int MaxSemantic = 256, SemanticBudget = 2 * 128 * MaxSemantic;
+
+    /// <summary>The ASCII string at <paramref name="at"/> of its string table <paramref name="d"/>, up to its NUL, of at most
+    /// <paramref name="max"/> bytes; ArgumentException when it starts outside the table, runs past it or past
+    /// <paramref name="max"/>, or would take <paramref name="budget"/> below 0. Callers cache names by offset, so a shared
+    /// name is decoded once.</summary>
+    static string Name(ReadOnlySpan<byte> d, int at, ref long budget, int max = int.MaxValue)
+    {
+        if ((uint)at > (uint)d.Length) throw new ArgumentException("a name outside its string table");
+        var n = d[at..][..(int)Math.Min(max + 1L, d.Length - at)].IndexOf((byte)0);
+        if (n < 0) throw new ArgumentException(d.Length - at > max ? $"a name over {max} bytes" : "a name without its end");
+        if ((budget -= 2L * n) < 0) throw new ArgumentException("names over the part's budget");   // UTF-16 once decoded
+        return Encoding.ASCII.GetString(d.Slice(at, n));
+    }
+
     /// <summary>Stage, shader model, signatures and bindings (DXIL: PSV0; DXBC: SHEX/SHDR dcl_*, UE strips RDEF).
     /// Null when the program part is missing or of a kind D3D12 PSOs don't take.</summary>
     public static ShaderInfo? Parse(ReadOnlySpan<byte> c, string sha1, ResourceCounts counts)
@@ -119,15 +183,20 @@ public static class ShaderContainer
         {
             var d = Dxbc.Part(c, Encoding.ASCII.GetBytes(k));
             if (d.IsEmpty) continue;
+            var count = U(d, 0);
+            if (count > MaxSigElements || U(d, 4) + (long)count * size > d.Length) throw new ArgumentException($"{k}: {count} elements don't fit the part");
             var list = new List<SigElement>();
-            for (var e = 0; e < (int)U(d, 0); e++)
+            var names = new Dictionary<int, string>();   // elements may share a name
+            long budget = SemanticBudget;
+            for (var e = 0; e < (int)count; e++)
             {
                 var o = (int)U(d, 4) + e * size;
                 var b = size == 24 ? o - 4 : o; // 24-byte elements have no leading Stream field
                 var nameOff = (int)U(d, b + 4);
-                var name = Encoding.ASCII.GetString(d[nameOff..][..d[nameOff..].IndexOf((byte)0)]);
-                // inputs: the used mask next to the declared one (ISGN ReadWriteMask, ISG1 AlwaysReads); outputs: unknown
-                var read = k[0] == 'I' ? d[b + 25] : SigElement.UnknownReadMask;
+                if (!names.TryGetValue(nameOff, out var name)) names[nameOff] = name = Name(d, nameOff, ref budget, MaxSemantic);
+                // next to the declared mask: an input's read components (ISGN ReadWriteMask, ISG1 AlwaysReads), an output's
+                // written ones (the declared mask without its NeverWrites components); a PSG1 element's: unknown
+                var read = k[0] == 'I' ? d[b + 25] : k == "PSG1" ? SigElement.UnknownReadMask : (byte)(d[b + 24] & ~d[b + 25]);
                 list.Add(new SigElement(name, (int)U(d, b + 8), (int)U(d, b + 20), d[b + 24], (int)U(d, b + 12), (int)U(d, b + 16), read));
             }
             sigs[k[..2]] = list;
@@ -135,6 +204,7 @@ public static class ShaderContainer
 
         uint version;
         var gsInput = 0; // D3D_PRIMITIVE; DXIL InputPrimitive and the SM4/5 token use the same numbering
+        var payload = 0;
         var bindings = new List<Binding>();
         if (Dxbc.Part(c, "DXIL"u8) is { IsEmpty: false } dxil)
         {
@@ -142,6 +212,8 @@ public static class ShaderContainer
             if (Dxbc.Part(c, "PSV0"u8) is { IsEmpty: false } psv) // u32 RuntimeInfoSize, RuntimeInfo, u32 ResourceCount, u32 BindInfoSize, PSVResourceBindInfo[]
             {
                 if (version >> 16 == 2 && U(psv, 0) >= 4) gsInput = (int)U(psv, 4); // RuntimeInfo starts with the stage union: GSInfo.InputPrimitive first
+                if (version >> 16 == 14 && U(psv, 0) >= 4) payload = (int)U(psv, 4); // ASInfo.PayloadSizeInBytes
+                if (version >> 16 == 13 && U(psv, 0) >= 12) payload = (int)U(psv, 12); // MSInfo: group shared, view-ID group shared, PayloadSizeInBytes
                 var o = 4 + (int)U(psv, 0);
                 var n = (int)U(psv, o);
                 var stride = n > 0 ? (int)U(psv, o + 4) : 0; // DXC writes the stride only when there are resources
@@ -168,13 +240,15 @@ public static class ShaderContainer
                 var cls = op switch { 0x59 => "cbv", 0x5A => "sampler", 0x58 or 0xA1 or 0xA2 => "srv", 0x9C or 0x9D or 0x9E => "uav", _ => null };
                 if (cls != null)
                 {
-                    var q = p + 1;
-                    if ((t[p] & 0x80000000) != 0) while ((t[q++] & 0x80000000) != 0) { } // extended opcode tokens
-                    var operand = t[q++];
-                    if ((operand & 0x80000000) != 0) while ((t[q++] & 0x80000000) != 0) { } // extended operand tokens
+                    // extended tokens only within the instruction: a chain past it would be followed into every instruction after
+                    var (q, end) = (p + 1, p + n);
+                    if ((t[p] & 0x80000000) != 0) while (q < end && (t[q++] & 0x80000000) != 0) { } // extended opcode tokens
+                    var operand = q < end ? t[q++] : 0;
+                    if ((operand & 0x80000000) != 0) while (q < end && (t[q++] & 0x80000000) != 0) { } // extended operand tokens
                     // SM5.1: operand indices are (range id, lower, upper), register space = the instruction's last token; SM5.0: index 0 = register
-                    bindings.Add(sm51 ? new Binding(cls, (int)t[p + n - 1], (int)t[q + 1], t[q + 2] == uint.MaxValue ? -1 : (int)(t[q + 2] - t[q + 1] + 1))
-                                      : new Binding(cls, 0, (int)t[q], 1));
+                    if (q + (sm51 ? 2 : 0) < end)
+                        bindings.Add(sm51 ? new Binding(cls, (int)t[end - 1], (int)t[q + 1], t[q + 2] == uint.MaxValue ? -1 : (int)(t[q + 2] - t[q + 1] + 1))
+                                          : new Binding(cls, 0, (int)t[q], 1));
                 }
                 p += n;
             }
@@ -182,7 +256,8 @@ public static class ShaderContainer
         else return null;
 
         var kind = (int)(version >> 16);
-        if (kind == 6 && bindings.Count == 0) bindings.AddRange(Rdat(c).Resources); // a DXIL library has no PSV0: its resources are in RDAT
+        var rdat = kind == 6 ? Rdat(c) : default;
+        if (kind == 6 && bindings.Count == 0) bindings.AddRange(rdat.Resources); // a DXIL library has no PSV0: its resources are in RDAT
         Stage? stage = kind switch
         {
             0 => Stage.Pixel, 1 => Stage.Vertex, 2 => Stage.Geometry, 3 => Stage.Hull, 4 => Stage.Domain, 5 => Stage.Compute,
@@ -193,17 +268,18 @@ public static class ShaderContainer
             sigs["OS"] = [.. sigs.GetValueOrDefault("OS") ?? [], .. prim.Select(e => e with { Register = PrimitiveRow | (e.Register & 0xFFFF) })];
         string[] prefix = ["ps", "vs", "gs", "hs", "ds", "cs", "lib", "", "", "", "", "", "", "ms", "as"];
         if (stage == Stage.Pixel && sigs.TryGetValue("IS", out var ins) && InputInterpolation(c) is { Count: > 0 } modes) // DXIL only
-            sigs["IS"] = ins.Select(e => modes.TryGetValue(e.Semantic.ToUpperInvariant() + e.Index, out var m) ? e with { Interpolation = m } : e).ToList();
+            sigs["IS"] = ins.Select(e => modes.TryGetValue((e.Semantic, e.Index), out var m) ? e with { Interpolation = m } : e).ToList();
         return new ShaderInfo(sha1, stage.Value, $"{prefix[kind]}_{(version >> 4) & 0xF}_{version & 0xF}", c.Length, counts, bindings,
-            sigs.GetValueOrDefault("IS") ?? [], sigs.GetValueOrDefault("OS") ?? [], stage == Stage.Geometry ? gsInput : 0, InlineRayTracing: Dxbc.InlineRayTracing(c));
+            sigs.GetValueOrDefault("IS") ?? [], sigs.GetValueOrDefault("OS") ?? [], stage == Stage.Geometry ? gsInput : 0, InlineRayTracing: Dxbc.InlineRayTracing(c), Payload: payload, ViewId: Dxbc.ViewId(c),
+            RayGeneration: rdat.Functions?.Any(f => f.Kind == 7) == true);
     }
 
-    /// <summary>A DXIL pixel shader's interpolation mode per named input (PSV0 signature elements: "SEMANTIC" + index,
-    /// upper case -> D3D_INTERPOLATION_MODE-like DXIL mode: 1 constant, 2 linear, 3 linear centroid, 4 noperspective, ...);
+    /// <summary>A DXIL pixel shader's interpolation mode per named input (PSV0 signature elements: (semantic, index), the
+    /// semantic compared without case -> D3D_INTERPOLATION_MODE-like DXIL mode: 1 constant, 2 linear, 3 linear centroid, 4 noperspective, ...);
     /// empty for DXBC or without PSV0. System values (no name there) are left out.</summary>
-    public static Dictionary<string, int> InputInterpolation(ReadOnlySpan<byte> c)
+    public static Dictionary<(string Semantic, int Index), int> InputInterpolation(ReadOnlySpan<byte> c)
     {
-        var modes = new Dictionary<string, int>();
+        var modes = new Dictionary<(string Semantic, int Index), int>(SemanticKey.Instance);
         var v = Dxbc.Part(c, "PSV0"u8);
         if (4 + 30 > v.Length) return modes;                        // no RuntimeInfo1: no signature elements
         var inputs = v[4 + 28];                                     // RuntimeInfo1.SigInputElements
@@ -211,20 +287,31 @@ public static class ShaderContainer
         var p = 4 + (int)U(v, 0);                                   // PSVRuntimeInfo (0..3)
         var resources = (int)U(v, p); p += 4;
         if (resources > 0) p += 4 + resources * (int)U(v, p);      // bind info size, then the bindings
-        var strings = p + 4; p = strings + (int)U(v, p);
+        var (strings, stringsSize) = (p + 4, (int)U(v, p)); p = strings + stringsSize;
+        if (p > v.Length) return modes;
+        var table = v.Slice(strings, stringsSize);
+        var budget = NameBudget(stringsSize);
+        var names = new Dictionary<int, string>();
         var indexes = p + 4; p = indexes + 4 * (int)U(v, p);
         var size = (int)U(v, p); p += 4;                            // PSVSignatureElement0: 16 bytes
-        for (var e = 0; e < inputs && p + (e + 1) * size <= v.Length; e++)
+        for (var e = 0; e < inputs && size > 0 && p + (e + 1) * size <= v.Length; e++)
         {
             var q = p + e * size;
-            var name = strings + (int)U(v, q);
-            var len = v[name..].IndexOf((byte)0);
-            if (len <= 0) continue; // a system value
-            var semantic = Encoding.ASCII.GetString(v.Slice(name, len)).ToUpperInvariant();
+            var at = (int)U(v, q);
+            if (!names.TryGetValue(at, out var semantic)) names[at] = semantic = Name(table, at, ref budget);
+            if (semantic.Length == 0) continue; // a system value
             for (var r = 0; r < v[q + 8]; r++) // an element of several rows (TEXCOORD10 + TEXCOORD11) lists one index per row
-                modes[semantic + U(v, indexes + 4 * ((int)U(v, q + 4) + r))] = v[q + 13];
+                modes[(semantic, (int)U(v, indexes + 4 * ((int)U(v, q + 4) + r)))] = v[q + 13];
         }
         return modes;
+    }
+
+    /// <summary>(semantic, index) keys with the semantic compared without case, as the runtime links them; the name isn't copied.</summary>
+    sealed class SemanticKey : IEqualityComparer<(string Semantic, int Index)>
+    {
+        public static readonly SemanticKey Instance = new();
+        public bool Equals((string Semantic, int Index) a, (string Semantic, int Index) b) => a.Index == b.Index && StringComparer.OrdinalIgnoreCase.Equals(a.Semantic, b.Semantic);
+        public int GetHashCode((string Semantic, int Index) k) => HashCode.Combine(StringComparer.OrdinalIgnoreCase.GetHashCode(k.Semantic), k.Index);
     }
 
     /// <summary>One function of a DXIL library (RDAT function table): its DXIL shader kind (7 ray generation, 8 intersection,
@@ -243,7 +330,11 @@ public static class ShaderContainer
         var parts = new Dictionary<uint, int>(); // part type -> data offset
         for (var p = 0; p < (int)U(r, 4); p++) { var o = (int)U(r, 8 + 4 * p); parts[U(r, o)] = o + 8; }
         if (!parts.TryGetValue(1, out var strings)) return (fns, res);
-        string Str(uint off) { var from = strings + (int)off; return Encoding.ASCII.GetString(r, from, Array.IndexOf(r, (byte)0, from) - from); }
+        var stringsSize = (int)U(r, strings - 4);
+        if ((uint)stringsSize > (uint)(r.Length - strings)) throw new ArgumentException("RDAT: the string table runs past the part");
+        var budget = NameBudget(stringsSize);
+        var names = new Dictionary<uint, string>();
+        string Str(uint off) => names.TryGetValue(off, out var s) ? s : names[off] = Name(r.AsSpan(strings, stringsSize), (int)off, ref budget);
         if (parts.TryGetValue(3, out var rt)) // RuntimeDataResourceInfo: class, kind, id, space, lower, upper, name, flags
             for (var k = 0; k < (int)U(r, rt) && (int)U(r, rt + 4) >= 24; k++)
             {

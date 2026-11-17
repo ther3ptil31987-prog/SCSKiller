@@ -1,7 +1,7 @@
 # build outputs
 proxy/build/
-tools/ueshaders/bin/
-tools/ueshaders/obj/
+proxy/build-x86/
+proxy/build-linux/
 __pycache__/
 
 # game content and third-party binaries: never commit
@@ -13,15 +13,10 @@ out/
 # runtime artifacts
 *.log
 *.csv
+!tests/SCSKiller.Tests/Fixtures/**/*.csv
 bin/
 obj/
 .claude/
 
 # packaging output (build/publish.ps1)
 dist/
-
-# the export leak scan's private words (build/export-public.ps1): real names, hosts and addresses
-build/private-words.txt
-
-# tools/measure.ps1 downloads PresentMon here
-tools/.bin/
